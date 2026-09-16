@@ -23,6 +23,73 @@ def message(mid, text, role="user"):
 
 
 class ContextTests(unittest.TestCase):
+    def test_decision_and_reply_share_previous_window_sources(self):
+        records = [message(7, "current unique question")]
+        previous = [message(6, "previous bot offered help", "assistant")]
+        kwargs = {
+            "previous_messages": previous,
+            "previous_summary": {"window_id": 2, "text": "summary unique topic"},
+        }
+        for output in (
+            builder.render_decision(records, **kwargs),
+            builder.render_context(records, **kwargs),
+        ):
+            self.assertIn("previous bot offered help", output)
+            self.assertIn("summary unique topic", output)
+            self.assertIn("current unique question", output)
+            self.assertIn('"role":"assistant"', output)
+        self.assertIn("历史已答问题不是新请求", builder.render_decision(records))
+
+    def test_multiple_images_have_explicit_source_ids_even_when_current_excluded(self):
+        sources = [
+            {"message_id": 7, "image_index": 1},
+            {"message_id": 7, "image_index": 2},
+            {"message_id": 6, "image_index": 3},
+        ]
+        kwargs = {"image_sources": sources, "max_chars": 4000}
+        for output in (
+            builder.render_decision([message(7, "image text")], **kwargs),
+            builder.render_context(
+                [message(7, "image text")], current_message_id=7, **kwargs
+            ),
+        ):
+            parsed = [
+                json.loads(line) for line in output.splitlines() if line.startswith("{")
+            ]
+            mapped = [line for line in parsed if "image_index" in line]
+            self.assertEqual(
+                mapped,
+                [
+                    {"image_index": x["image_index"], "message_id": x["message_id"]}
+                    for x in sources
+                ],
+            )
+            self.assertIn("未实际提供的图片不可推断", output)
+
+    def test_multimodal_source_sections_respect_escaped_budget(self):
+        records = [message(i, '\n"\\' * 1000) for i in range(20)]
+        kwargs = {
+            "previous_messages": records[:4],
+            "previous_summary": {"text": '\n"\\' * 5000, "window_id": '"\\' * 100},
+            "image_sources": [
+                {"message_id": '"\\' * 100, "image_index": i + 1} for i in range(8)
+            ],
+        }
+        for size in (512, 1024, 4000):
+            for render in (builder.render_context, builder.render_decision):
+                output = render(records, max_chars=size, **kwargs)
+                self.assertLessEqual(len(output), size)
+                for line in output.splitlines():
+                    if line.startswith("{"):
+                        json.loads(line)
+
+    def test_summary_marks_image_placeholders_as_unseen(self):
+        output = builder.render_summary(
+            [message(1, "[非文本消息：Image]")], window_id=1
+        )
+        self.assertIn("本次无图片输入", output)
+        self.assertIn("[非文本消息：Image]", output)
+
     def test_current_input_not_duplicated_and_previous_sources_labeled(self):
         result = builder.render_context(
             [message(1, "old topic"), message(2, "current unique input")],
@@ -119,6 +186,36 @@ class ContextTests(unittest.TestCase):
             [current], previous_messages=[current], current_message_id=99
         )
         self.assertNotIn("live input unique", output)
+
+    def test_decision_focus_keeps_body_when_not_last_record(self):
+        output = builder.render_decision(
+            [message(7, "trigger body"), message(8, "later record")],
+            current_message_id=7,
+        )
+        self.assertIn('"current_input_message_id":7', output)
+        self.assertIn("trigger body", output)
+        self.assertIn("later record", output)
+        self.assertLessEqual(
+            len(
+                builder.render_decision(
+                    [], current_message_id="\x00" * 1000, max_chars=512
+                )
+            ),
+            512,
+        )
+
+    def test_current_image_mapping_keeps_live_input_identity_within_budget(self):
+        current = message(7, "live unique text" + '\n"' * 500)
+        output = builder.render_context(
+            [current],
+            current_message_id=7,
+            image_sources=[{"message_id": 7, "image_index": 1}],
+            max_chars=512,
+        )
+        self.assertLessEqual(len(output), 512)
+        self.assertNotIn("live unique text", output)
+        self.assertIn('"current_input_message_id":7', output)
+        self.assertIn('"image_index":1,"message_id":7', output)
 
     def test_newest_records_retained_when_input_exceeds_store_cap(self):
         records = [message(i, f"raw-{i}") for i in range(205)]

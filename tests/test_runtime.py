@@ -334,8 +334,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_request_final_saved_and_no_old_history_or_media_loss(self):
         event = Event(1, direct=True)
+        image_path = Path(self.temp.name) / "image.png"
+        image_path.write_bytes(b"offline test image")
         event.message_obj.message += [
-            Image(path="image.png"),
+            Image(path=str(image_path)),
             Reply(sender_id="someone", chain=[Record(path="audio.wav")]),
         ]
         generator = self.plugin.on_group_message(event)
@@ -350,7 +352,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(event, req)
         self.assertIsNone(req.conversation)
         self.assertEqual(req.system_prompt, "native persona")
-        self.assertEqual(req.image_urls, ["image.png"])
+        self.assertEqual(req.image_urls, [str(image_path)])
         self.assertEqual(req.audio_urls, ["audio.wav"])
         self.assertEqual(req.extra_user_content_parts[0].text, "current quote")
         await self.plugin.on_llm_response(

@@ -31,6 +31,8 @@ PRESETS = {
     ),
 }
 LIMITS = {
+    "max_context_images": (0, 8, True),
+    "image_retention_minutes": (1, 1440, False),
     "max_merge_wait_seconds": (0, 30, False),
     "idle_minutes": (1, 1440, False),
     "merge_wait_seconds": (0, 10, False),
@@ -58,6 +60,9 @@ ALIASES = {
     "summary_timeout_seconds": "summary_timeout",
 }
 GROUP_FIELDS = {
+    "image_input_enabled",
+    "max_context_images",
+    "image_retention_minutes",
     "idle_minutes",
     "merge_wait_seconds",
     "decision_cooldown_seconds",
@@ -94,9 +99,15 @@ def _overrides(raw, group=False):
             if type(value) is not bool:
                 raise ValueError("decision_log_reasoning must be boolean")
             result[key] = value
-        elif key in {"auto_reply", "summary_enabled"}:
+        elif key in {"auto_reply", "summary_enabled", "image_input_enabled"}:
             if value == "inherit":
                 continue
+            if (
+                group
+                and key == "image_input_enabled"
+                and value in ("enabled", "disabled")
+            ):
+                value = value == "enabled"
             if type(value) is not bool:
                 raise ValueError(f"{key} must be boolean")
             result[key] = value
@@ -123,6 +134,9 @@ def _overrides(raw, group=False):
 @dataclass(frozen=True)
 class Settings:
     enabled: bool = True
+    image_input_enabled: bool = True
+    max_context_images: int = 4
+    image_retention_minutes: float = 20
     group_ids: tuple[str, ...] = ()
     group_discovery_enabled: bool = True
     selected_groups: tuple[str, ...] = ()

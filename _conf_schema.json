@@ -10,6 +10,9 @@
       "group_id":{"type":"string","default":"","description":"精确群 ID 或完整会话 UMO","hint":"完整 UMO 优先于群规则；此处不会扩大接管名单。添加规则后必须填写。"},
       "preset":{"type":"string","default":"inherit","options":["inherit","small","balanced","busy"],"description":"场景；inherit 跟随全局"},
       "reply_mode":{"type":"string","default":"inherit","options":["inherit","smart","mention_only"],"description":"参与方式","hint":"smart 自行判断普通消息；mention_only 只响应明确唤醒。"},
+      "image_input_enabled":{"type":"string","default":"inherit","options":["inherit","enabled","disabled"],"description":"图片直传","hint":"inherit 继承；enabled 开启；disabled 关闭。判断及正式模型须支持图片。"},
+      "max_context_images":{"type":"int","default":-1,"description":"最多直传图片数（-1 继承，0 关闭，最多 8）"},
+      "image_retention_minutes":{"type":"float","default":-1,"description":"图片引用保留分钟（-1 继承，1–1440）"},
       "idle_minutes":{"type":"float","default":-1,"description":"闲置几分钟切换窗口（-1 继承）"},
       "merge_wait_seconds":{"type":"float","default":-1,"description":"短消息合并等待秒数（-1 继承，0 关闭）"},
       "decision_cooldown_seconds":{"type":"float","default":-1,"description":"普通消息判断冷却秒数（-1 继承）"},
@@ -20,6 +23,9 @@
     }}}
   },
   "advanced":{"type":"object","description":"高级设置（可选）","hint":"所有数值 -1 采用场景/默认值；0 仅用于支持关闭的项目。群显式值 > 全局显式值 > 群场景 > 全局场景。冷却不限制明确 @。","items":{
+    "image_input_enabled":{"type":"bool","default":true,"description":"向判断及正式模型直传图片","hint":"模型不支持图片时关闭。不额外调用图片描述模型；旧历史中的纯文本图片占位无法还原图片。"},
+    "max_context_images":{"type":"int","default":-1,"description":"最多直传图片数（默认 4，0 关闭，最多 8）","hint":"0 同时关闭当前和历史图片直传。"},
+    "image_retention_minutes":{"type":"float","default":-1,"description":"图片引用保留分钟（默认 20，1–1440）","hint":"保存近期图片引用 20 分钟。缓存仅在内存，不跨插件重载；只保留文件引用，不删除平台缓存文件。"},
     "reply_mode":{"type":"string","default":"inherit","options":["inherit","smart","mention_only"],"description":"参与方式；默认自行判断"},
     "idle_minutes":{"type":"float","default":-1,"description":"切窗闲置分钟（1–1440）"},
     "merge_wait_seconds":{"type":"float","default":-1,"description":"短消息合并等待秒数（0–10）"},

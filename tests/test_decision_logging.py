@@ -15,8 +15,10 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = runtime.AstrbotGroupChatLite(Context(), {"group_ids": ["-10"]})
         self.cfg = types.SimpleNamespace(
-            decision_provider_id="", decision_max_chars=4000,
-            decision_timeout=0.1, decision_log_reasoning=False,
+            decision_provider_id="",
+            decision_max_chars=4000,
+            decision_timeout=0.1,
+            decision_log_reasoning=False,
         )
         self.plugin._settings = lambda *args: self.cfg
         self.provider = types.SimpleNamespace(text_chat=AsyncMock())
@@ -36,16 +38,33 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def decide(self, reasoning=None, verdict="yes"):
         self.provider.text_chat.return_value = types.SimpleNamespace(
-            completion_text=verdict, reasoning_content=reasoning,
+            completion_text=verdict,
+            reasoning_content=reasoning,
         )
-        return await self.plugin._decide(Event(1), [{
-            "id": 1, "role": "user", "text": "private prompt input",
-            "event_at": 1000, "sender_id": "user", "sender_name": "user",
-        }])
+        return await self.plugin._decide(
+            Event(1),
+            [
+                {
+                    "id": 1,
+                    "role": "user",
+                    "text": "private prompt input",
+                    "event_at": 1000,
+                    "sender_id": "user",
+                    "sender_name": "user",
+                }
+            ],
+        )
 
     def logged_payload(self):
-        self.log.info.assert_called_once()
+        self.assertEqual(self.log.info.call_count, 2)
         return json.loads(self.log.info.call_args.args[1])
+
+    def verdict_payload(self):
+        payload = self.logged_payload()
+        self.assertEqual(payload["truncated"], payload["reasoning_truncated"])
+        self.assertEqual(payload["source_current_records"], 1)
+        self.assertEqual(payload["image_count"], 0)
+        return {k: payload[k] for k in ("decision", "reasoning", "truncated")}
 
     async def test_disabled_does_not_log_reasoning_or_verdict(self):
         self.assertTrue(await self.decide("provider reasoning"))
@@ -55,9 +74,14 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_enabled_logs_explicit_field_and_keeps_request_unchanged(self):
         self.cfg.decision_log_reasoning = True
         self.assertTrue(await self.decide("模型显式返回的简短推理"))
-        self.assertEqual(self.logged_payload(), {
-            "decision": "yes", "reasoning": "模型显式返回的简短推理", "truncated": False,
-        })
+        self.assertEqual(
+            self.verdict_payload(),
+            {
+                "decision": "yes",
+                "reasoning": "模型显式返回的简短推理",
+                "truncated": False,
+            },
+        )
         kwargs = self.provider.text_chat.await_args.kwargs
         self.assertEqual(kwargs["system_prompt"], runtime.DECISION_PROMPT)
         self.assertEqual(kwargs["contexts"], [])
@@ -68,9 +92,14 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_enabled_without_reasoning_marks_missing(self):
         self.cfg.decision_log_reasoning = True
         self.assertFalse(await self.decide(None, "no"))
-        self.assertEqual(self.logged_payload(), {
-            "decision": "no", "reasoning": "未返回推理内容", "truncated": False,
-        })
+        self.assertEqual(
+            self.verdict_payload(),
+            {
+                "decision": "no",
+                "reasoning": "未返回推理内容",
+                "truncated": False,
+            },
+        )
 
     async def test_reasoning_is_capped_at_4000_characters(self):
         self.cfg.decision_log_reasoning = True
@@ -82,22 +111,33 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_controls_and_unicode_line_separators_are_escaped(self):
         self.cfg.decision_log_reasoning = True
-        reasoning = '中文\n[INFO] forged\r\t\x00\x1b\x85\u2028\u2029\u202e\U000e0001"end"'
+        reasoning = (
+            '中文\n[INFO] forged\r\t\x00\x1b\x85\u2028\u2029\u202e\U000e0001"end"'
+        )
         self.assertTrue(await self.decide(reasoning))
         self.assertEqual(self.logged_payload()["reasoning"], reasoning)
         encoded = self.log.info.call_args.args[1]
-        self.assertFalse(any(unicodedata.category(c) in {"Cc", "Cf", "Zl", "Zp"} for c in encoded))
+        self.assertFalse(
+            any(unicodedata.category(c) in {"Cc", "Cf", "Zl", "Zp"} for c in encoded)
+        )
         self.assertIn("中文", encoded)
 
     async def test_failure_and_timeout_keep_one_safe_warning(self):
         for enabled in (False, True):
-            for exception in (RuntimeError("SECRET_PROMPT https://secret.invalid"), asyncio.TimeoutError()):
+            for exception in (
+                RuntimeError("SECRET_PROMPT https://secret.invalid"),
+                asyncio.TimeoutError(),
+            ):
                 with self.subTest(enabled=enabled, exception=type(exception).__name__):
                     self.log.reset_mock()
                     self.cfg.decision_log_reasoning = enabled
                     self.provider.text_chat.side_effect = exception
                     self.assertFalse(await self.plugin._decide(Event(1), []))
-                    self.log.info.assert_not_called()
+                    if enabled:
+                        self.log.info.assert_called_once()
+                        self.assertIn("判断输入统计", self.log.info.call_args.args[0])
+                    else:
+                        self.log.info.assert_not_called()
                     self.log.warning.assert_called_once()
                     template, error_type = self.log.warning.call_args.args
                     self.assertEqual(error_type, type(exception).__name__)

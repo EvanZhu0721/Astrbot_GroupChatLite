@@ -20,6 +20,47 @@ def defaults(items):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_image_defaults_and_group_overrides(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        settings = Settings.from_mapping(defaults(schema))
+        self.assertTrue(settings.image_input_enabled)
+        self.assertEqual(settings.max_context_images, 4)
+        self.assertEqual(settings.image_retention_minutes, 20)
+        settings = Settings.from_mapping(
+            {
+                "group_overrides": [
+                    {
+                        "group_id": "a",
+                        "image_input_enabled": "disabled",
+                        "max_context_images": 0,
+                        "image_retention_minutes": 1,
+                    },
+                    {
+                        "group_id": "b",
+                        "image_input_enabled": "inherit",
+                        "max_context_images": -1,
+                    },
+                ]
+            }
+        )
+        self.assertFalse(settings.effective("a", "a").image_input_enabled)
+        self.assertEqual(settings.effective("a", "a").max_context_images, 0)
+        self.assertEqual(settings.effective("a", "a").image_retention_minutes, 1)
+        self.assertTrue(settings.effective("b", "b").image_input_enabled)
+        self.assertEqual(settings.effective("b", "b").max_context_images, 4)
+
+    def test_image_options_reject_invalid_ranges(self):
+        for key, value in (
+            ("image_input_enabled", "false"),
+            ("max_context_images", 9),
+            ("max_context_images", 1.5),
+            ("image_retention_minutes", 0),
+            ("image_retention_minutes", 1441),
+            ("image_retention_minutes", float("inf")),
+        ):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                Settings.from_mapping({"advanced": {key: value}})
+
     def test_discovery_defaults_do_not_select_or_enable_any_group(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         for config in ({}, defaults(schema)):
