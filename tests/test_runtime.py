@@ -184,6 +184,9 @@ class Context:
             persona_id="persona",
             cid="cid",
         )
+        self.persona_manager = types.SimpleNamespace(
+            resolve_selected_persona=AsyncMock(return_value=(None, None, None, False))
+        )
         self.conversation_manager = types.SimpleNamespace(
             get_curr_conversation_id=AsyncMock(return_value="cid"),
             get_conversation=AsyncMock(side_effect=lambda *a, **k: self.original),

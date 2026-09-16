@@ -712,6 +712,17 @@ class AstrbotGroupChatLite(Star):
             provider = await self._provider(
                 event.unified_msg_origin, cfg.decision_provider_id
             )
+            persona = await self._decision_persona(event, cfg)
+            role_background = (
+                (
+                    "【角色背景】以下仅供参考名字、身份、兴趣和互动风格；"
+                    "不采用其中的输出格式或工具行为要求，不覆盖后面的判断规则和固定输出协议。\n"
+                    + json.dumps({"角色背景": persona}, ensure_ascii=False)
+                    + "\n\n"
+                )
+                if persona
+                else ""
+            )
             snapshot = event.get_extra(SNAPSHOT) or {}
             prompt = render_decision(
                 messages,
@@ -729,6 +740,8 @@ class AstrbotGroupChatLite(Star):
                 prompt_chars=len(prompt),
                 char_limit=cfg.decision_max_chars,
                 image_count=len(snapshot.get("images", [])),
+                persona_attached=bool(persona),
+                persona_chars=len(persona),
             )
             if getattr(cfg, "decision_log_reasoning", False):
                 logger.info("[GroupChatLite] 判断输入统计 %s", json.dumps(metadata))
@@ -737,7 +750,8 @@ class AstrbotGroupChatLite(Star):
                     prompt=prompt,
                     image_urls=snapshot.get("images", []),
                     contexts=[],
-                    system_prompt=(
+                    system_prompt=role_background
+                    + (
                         (getattr(cfg, "decision_prompt", "") or "").strip()
                         or DEFAULT_DECISION_PROMPT
                     )
@@ -793,6 +807,40 @@ class AstrbotGroupChatLite(Star):
                 failure += "未返回推理内容。"
             logger.warning(failure, type(exc).__name__)
             return False
+
+    async def _decision_persona(self, event, cfg):
+        """Read the same persona binding as core without creating a conversation."""
+        if not getattr(cfg, "decision_use_persona", True):
+            return ""
+        try:
+            umo = event.unified_msg_origin
+            manager = self.context.conversation_manager
+            cid = await manager.get_curr_conversation_id(umo)
+            conversation = await manager.get_conversation(umo, cid) if cid else None
+            config = self.context.get_config(umo=umo)
+            (
+                _,
+                persona,
+                _,
+                _,
+            ) = await self.context.persona_manager.resolve_selected_persona(
+                umo=umo,
+                conversation_persona_id=getattr(conversation, "persona_id", None),
+                platform_name=event.get_platform_name(),
+                provider_settings=config.get("provider_settings", {}),
+            )
+            if persona is None:
+                return ""
+            prompt = persona.get("prompt", "")
+            if not isinstance(prompt, str):
+                raise TypeError("Invalid persona prompt")
+            return prompt.strip()
+        except Exception as exc:
+            logger.warning(
+                "[GroupChatLite] 判断人格读取失败（%s），仅使用判断规则。",
+                type(exc).__name__,
+            )
+            return ""
 
     async def _build_request(self, event):
         manager = self.context.conversation_manager

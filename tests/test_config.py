@@ -20,6 +20,37 @@ def defaults(items):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_decision_persona_defaults_and_group_switches(self):
+        self.assertTrue(Settings.from_mapping({}).decision_use_persona)
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertTrue(Settings.from_mapping(defaults(schema)).decision_use_persona)
+        settings = Settings.from_mapping(
+            {
+                "advanced": {"decision_use_persona": False},
+                "group_overrides": [
+                    {"group_id": "a", "decision_use_persona": "inherit"},
+                    {"group_id": "b", "decision_use_persona": "enabled"},
+                    {"group_id": "c", "decision_use_persona": "disabled"},
+                ],
+            }
+        )
+        self.assertFalse(settings.effective("umo", "a").decision_use_persona)
+        self.assertTrue(settings.effective("umo", "b").decision_use_persona)
+        self.assertFalse(settings.effective("umo", "c").decision_use_persona)
+
+    def test_decision_persona_rejects_invalid_values(self):
+        for value in (None, 1, [], "enabled", "disabled", "true"):
+            with self.assertRaises(ValueError):
+                Settings.from_mapping({"advanced": {"decision_use_persona": value}})
+        with self.assertRaises(ValueError):
+            Settings.from_mapping(
+                {
+                    "group_overrides": [
+                        {"group_id": "a", "decision_use_persona": "false"}
+                    ]
+                }
+            )
+
     def test_decision_prompt_default_and_schema(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         field = schema["advanced"]["items"]["decision_prompt"]
