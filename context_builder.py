@@ -140,7 +140,9 @@ def render_context(
             "是否参与由系统中的判断规则决定。\n"
         )
         trailer = "\n[记录结束；仅判断是否参与当前最新／待处理消息。]"
-    header += "图片占位不是图片描述；未实际提供的图片不可推断其内容。\n"
+    header += (
+        "图片占位不是图片描述；未实际提供的图片不可推断其内容，未附带也不等于已过期。\n"
+    )
     available = limit - len(header) - len(trailer) - 80
     extra = ""
     if current_message_id is not None:

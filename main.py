@@ -31,6 +31,7 @@ from .context_builder import (
 )
 from .store import Store
 from .media_cache import MediaCache
+from .owned_media_cache import OwnedMediaCache
 from .send_observer import install_send_observer
 from .scoring import parse_model_score, score_decision
 from .scoring_state import ScoringState
@@ -94,17 +95,26 @@ class AstrbotGroupChatLite(Star):
         self._scoring_state = ScoringState(clock=lambda: self._monotonic())
 
     async def initialize(self):
-        if self.store is None:
-            self.store = Store(
-                StarTools.get_data_dir("Astrbot_GroupChatLite") / "chat.sqlite3"
+        self._stopping = False
+        data_dir = StarTools.get_data_dir("Astrbot_GroupChatLite")
+        if not isinstance(self._media, OwnedMediaCache):
+            self._media.clear()
+            self._media = OwnedMediaCache(
+                data_dir / "image_cache", clock=lambda: self._monotonic()
             )
-        self._refresh_group_options()
-        if self.settings.enabled and self.settings.group_ids:
-            self._spawn(self._idle_worker())
-        else:
-            logger.info(
-                "[GroupChatLite] 未接管群聊：请先停用同群GCP、关闭群聊ICL，再填写group_ids。"
-            )
+        try:
+            if self.store is None:
+                self.store = Store(data_dir / "chat.sqlite3")
+            self._refresh_group_options()
+            if self.settings.enabled and self.settings.group_ids:
+                self._spawn(self._idle_worker())
+            else:
+                logger.info(
+                    "[GroupChatLite] 未接管群聊：请先停用同群GCP、关闭群聊ICL，再填写group_ids。"
+                )
+        except BaseException:
+            await self.terminate()
+            raise
 
     def _spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -431,9 +441,13 @@ class AstrbotGroupChatLite(Star):
                 r"\[非文本消息：[^\]]*\bImage\b[^\]]*\]", message["text"]
             ):
                 if message["id"] not in attached:
-                    message["text"] += (
-                        " [此消息图片未提供、已过期或超出图片预算；不能推断图像内容]"
-                    )
+                    if not getattr(cfg, "image_input_enabled", True):
+                        note = "图片输入已关闭，本次未附带图片"
+                    elif not limit:
+                        note = "本次图片数量上限为0，未附带图片"
+                    else:
+                        note = "此消息图片本次未附带，原因未确定；不要声称图片已过期"
+                    message["text"] += f" [{note}；不能推断图像内容]"
         return dict(
             window_id=window_id,
             messages=messages,
@@ -465,7 +479,9 @@ class AstrbotGroupChatLite(Star):
         ]
         for message in snapshot["messages"] + snapshot["previous_messages"]:
             if message["id"] in vanished:
-                message["text"] += " [图片文件已失效，本次未提供；不能推断图像内容]"
+                message["text"] += (
+                    " [此前选中的图片文件现已不可用，本次未附带；不能推断图像内容]"
+                )
 
     def _observe_score_message(self, event):
         raw = self._raw_message(event)
@@ -1118,7 +1134,14 @@ class AstrbotGroupChatLite(Star):
             item["message_id"] == snapshot.get("current_input_message_id")
             for item in snapshot.get("image_sources", [])
         ):
-            prompt += " [当前消息图片未提供、已过期或超出图片预算；不能推断图像内容]"
+            cfg = self._settings(event.unified_msg_origin, event.get_group_id())
+            if not getattr(cfg, "image_input_enabled", True):
+                note = "图片输入已关闭，本次未附带图片"
+            elif getattr(cfg, "max_context_images", 4) == 0:
+                note = "本次图片数量上限为0，未附带图片"
+            else:
+                note = "当前消息图片本次未附带，原因未确定；不要声称图片已过期"
+            prompt += f" [{note}；不能推断图像内容]"
         return event.request_llm(
             prompt=prompt,
             image_urls=images,
@@ -1389,7 +1412,9 @@ class AstrbotGroupChatLite(Star):
         self._tasks.clear()
         self._handlers.clear()
         self._summary_jobs.clear()
-        self._media.clear()
+        close_media = getattr(self._media, "close", self._media.clear)
+        close_media()
+        self._media = MediaCache(clock=lambda: self._monotonic())
         self._scoring_state.clear()
         self._rooms.clear()
         if self.store is not None:

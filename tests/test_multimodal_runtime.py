@@ -2,12 +2,14 @@
 
 import asyncio
 import dataclasses
+import os
 from pathlib import Path
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 import test_runtime as support
+import test_native_contract as native
 from test_runtime import Event, Image, Record, Reply, runtime
 
 
@@ -43,8 +45,115 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def image(self, name="image.png"):
         path = Path(self.temp.name) / name
-        path.write_bytes(b"offline image placeholder; no decoder/network used")
+        path.write_bytes(
+            b"offline image placeholder; no decoder/network used:" + name.encode()
+        )
         return Image(path=str(path))
+
+    def core_cleanup(self, event, path):
+        if not native.ROOT:
+            self.skipTest("Set ASTRBOT_ROOT to execute the real core cleanup method")
+        cleanup = native.load_node(
+            native.extract(
+                "astrbot/core/platform/astr_message_event.py",
+                "cleanup_temporary_local_files",
+            ),
+            {"os": os, "logger": Mock()},
+        )
+        event._temporary_local_files = [path]
+        cleanup(event)
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(event._temporary_local_files, [])
+
+    async def verify_core_cleanup_followup(self, mode):
+        self.configure()
+        photo = self.image()
+        original_bytes = Path(photo.path).read_bytes()
+        first = Event(1)
+        first.message_obj.message.append(photo)
+        if mode == "failure":
+            self.provider.text_chat.side_effect = RuntimeError(
+                "offline provider failure"
+            )
+            self.assertEqual(await self.consume(first), [])
+            self.provider.text_chat.side_effect = None
+        elif mode == "cancel":
+            entered = asyncio.Event()
+
+            async def delayed(**kwargs):
+                entered.set()
+                await asyncio.Event().wait()
+
+            self.provider.text_chat.side_effect = delayed
+            task = asyncio.create_task(self.consume(first))
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.provider.text_chat.side_effect = None
+        else:
+            self.assertEqual(len(await self.consume(first)), 1)
+        self.core_cleanup(first, photo.path)
+        request = (await self.consume(Event(2, "look at that image again")))[0]
+        attached = self.provider.text_chat.await_args.kwargs["image_urls"]
+        self.assertEqual(len(attached), 1)
+        self.assertEqual(request.image_urls, attached)
+        self.assertNotEqual(attached, [photo.path])
+        self.assertEqual(Path(attached[0]).read_bytes(), original_bytes)
+        self.assertIn(
+            "image_index", self.provider.text_chat.await_args.kwargs["prompt"]
+        )
+        self.assertFalse(self.plugin._rooms[first.unified_msg_origin].lock.locked())
+        await self.plugin.terminate()
+        self.assertFalse(Path(attached[0]).exists())
+
+    async def test_real_core_cleanup_keeps_image_for_next_decision_and_reply(self):
+        await self.verify_core_cleanup_followup("success")
+
+    async def test_failed_decision_then_core_cleanup_keeps_image_for_followup(self):
+        await self.verify_core_cleanup_followup("failure")
+
+    async def test_cancelled_decision_then_core_cleanup_keeps_image_for_followup(self):
+        await self.verify_core_cleanup_followup("cancel")
+
+    async def test_initialization_failure_releases_owned_cache_lock(self):
+        for failure in ("store", "later"):
+            directory = Path(self.temp.name) / failure
+            plugin = runtime.AstrbotGroupChatLite(self.context, {"group_ids": ["-10"]})
+            with patch.object(
+                runtime,
+                "StarTools",
+                types.SimpleNamespace(get_data_dir=lambda name: directory),
+            ):
+                target = (
+                    patch.object(
+                        runtime, "Store", side_effect=RuntimeError("store failure")
+                    )
+                    if failure == "store"
+                    else patch.object(
+                        plugin,
+                        "_refresh_group_options",
+                        side_effect=RuntimeError("later failure"),
+                    )
+                )
+                with target, self.assertRaises(RuntimeError):
+                    await plugin.initialize()
+            self.assertIsNone(plugin.store)
+            reopened = runtime.OwnedMediaCache(directory / "image_cache")
+            reopened.close()
+            with patch.object(
+                runtime,
+                "StarTools",
+                types.SimpleNamespace(get_data_dir=lambda name: directory),
+            ):
+                await plugin.initialize()
+            self.assertFalse(plugin._stopping)
+            photo = self.image(f"retry-{failure}.png")
+            plugin._media.put("bot:GroupMessage:-10", 1, [photo.path])
+            refs = plugin._media.select("bot:GroupMessage:-10", [1], 1)
+            self.assertEqual(len(refs), 1)
+            self.assertNotEqual(refs[0].image_url, photo.path)
+            await plugin.terminate()
 
     async def test_current_and_later_text_share_images_with_formal_agent(self):
         self.configure()
@@ -52,16 +161,19 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         first = Event(1, "picture")
         first.message_obj.message.append(photo)
         req1 = (await self.consume(first))[0]
+        copied = req1.image_urls
+        self.assertEqual(len(copied), 1)
+        self.assertNotEqual(copied, [photo.path])
+        self.assertEqual(Path(copied[0]).read_bytes(), Path(photo.path).read_bytes())
         self.assertEqual(
-            self.provider.text_chat.await_args.kwargs["image_urls"], [photo.path]
+            self.provider.text_chat.await_args.kwargs["image_urls"], copied
         )
-        self.assertEqual(req1.image_urls, [photo.path])
         second = Event(2, "what was in the image?")
         req2 = (await self.consume(second))[0]
         self.assertEqual(
-            self.provider.text_chat.await_args.kwargs["image_urls"], [photo.path]
+            self.provider.text_chat.await_args.kwargs["image_urls"], copied
         )
-        self.assertEqual(req2.image_urls, [photo.path])
+        self.assertEqual(req2.image_urls, copied)
         self.assertEqual(self.provider.text_chat.await_count, 2)
 
     async def test_merged_picture_survives_owner_becoming_text_message(self):
@@ -74,7 +186,8 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         later = asyncio.create_task(self.consume(Event(2, "follow up")))
         results = await asyncio.gather(earlier, later)
         self.assertEqual([len(x) for x in results], [0, 1])
-        self.assertEqual(results[1][0].image_urls, [photo.path])
+        self.assertEqual(len(results[1][0].image_urls), 1)
+        self.assertNotEqual(results[1][0].image_urls, [photo.path])
         self.assertEqual(self.provider.text_chat.await_count, 1)
 
     async def test_previous_window_bridge_summary_and_image_reach_decision(self):
@@ -82,7 +195,7 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         photo = self.image()
         event = Event(1, "old picture", direct=True)
         event.message_obj.message.append(photo)
-        await self.consume(event)
+        first_request = (await self.consume(event))[0]
         umo = event.unified_msg_origin
         window = self.plugin.store.active_window(umo)
         self.now += 700
@@ -99,7 +212,7 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         kwargs = self.provider.text_chat.await_args.kwargs
         self.assertIn("SUMMARY_SENTINEL", kwargs["prompt"])
         self.assertIn("old picture", kwargs["prompt"])
-        self.assertEqual(kwargs["image_urls"], [photo.path])
+        self.assertEqual(kwargs["image_urls"], first_request.image_urls)
         self.assertIn("SUMMARY_SENTINEL", req.extra_user_content_parts[-1].text)
 
     async def test_disabled_images_preserve_audio_and_do_not_convert_image(self):
@@ -117,6 +230,19 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.audio_urls, ["audio.wav"])
         photo.convert_to_file_path.assert_not_awaited()
         self.assertIn("不能推断", req.prompt)
+
+    async def test_zero_image_budget_is_not_described_as_expiration(self):
+        self.configure(max_context_images=0)
+        event = Event(1, direct=True)
+        photo = Image()
+        photo.convert_to_file_path = AsyncMock(side_effect=AssertionError("disabled"))
+        event.message_obj.message.append(photo)
+        request = (await self.consume(event))[0]
+        self.assertIn(
+            "数量上限为0", request.extra_user_content_parts[-1].text + request.prompt
+        )
+        self.assertEqual(request.image_urls, [])
+        photo.convert_to_file_path.assert_not_awaited()
 
     async def test_current_quote_and_history_share_total_cap_and_scope(self):
         self.configure(max_context_images=2)
@@ -150,8 +276,8 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不能推断", self.provider.text_chat.await_args.kwargs["prompt"])
         fresh = Event(3, direct=True)
         fresh.message_obj.message.append(image)
-        await self.consume(fresh)
-        Path(image.path).unlink()
+        copied = (await self.consume(fresh))[0].image_urls[0]
+        Path(copied).unlink()
         req = (await self.consume(Event(4)))[0]
         self.assertEqual(req.image_urls, [])
 
@@ -216,15 +342,17 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([len(r) for r in results], [1, 1])
         self.assertEqual(calls[0]["image_urls"], [])
         self.assertNotIn("NEXT_BATCH_SENTINEL", calls[0]["prompt"])
-        self.assertEqual(calls[1]["image_urls"], [image.path])
+        self.assertEqual(len(calls[1]["image_urls"]), 1)
+        self.assertNotEqual(calls[1]["image_urls"], [image.path])
 
     async def test_deleted_during_decision_is_removed_before_formal_request(self):
         self.configure()
         photo = self.image()
 
         async def decide(**kwargs):
-            self.assertEqual(kwargs["image_urls"], [photo.path])
-            Path(photo.path).unlink()
+            self.assertEqual(len(kwargs["image_urls"]), 1)
+            self.assertNotEqual(kwargs["image_urls"], [photo.path])
+            Path(kwargs["image_urls"][0]).unlink()
             return types.SimpleNamespace(
                 completion_text='{"score":0.9,"reason":"相关"}'
             )

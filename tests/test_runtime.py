@@ -213,6 +213,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.plugin.store = runtime.Store(Path(self.temp.name) / "chat.sqlite3")
+        self.plugin._media = runtime.OwnedMediaCache(
+            Path(self.temp.name) / "image_cache", clock=lambda: self.plugin._monotonic()
+        )
         self.now = 1000.0
         self.plugin._clock = lambda: self.now
         self.plugin._decide = AsyncMock(return_value=True)
@@ -499,7 +502,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(event, req)
         self.assertIsNone(req.conversation)
         self.assertEqual(req.system_prompt, "native persona")
-        self.assertEqual(req.image_urls, [str(image_path)])
+        self.assertEqual(len(req.image_urls), 1)
+        self.assertNotEqual(req.image_urls, [str(image_path)])
+        self.assertEqual(Path(req.image_urls[0]).read_bytes(), image_path.read_bytes())
         self.assertEqual(req.audio_urls, ["audio.wav"])
         self.assertEqual(req.extra_user_content_parts[0].text, "current quote")
         await self.plugin.on_llm_response(
