@@ -23,6 +23,15 @@ def message(mid, text, role="user"):
 
 
 class ContextTests(unittest.TestCase):
+    def test_decision_data_header_does_not_override_custom_participation_rules(self):
+        output = builder.render_decision(
+            [message(7, "ordinary conversation")], current_message_id=7
+        )
+        self.assertIn("判断规则", output)
+        self.assertIn("历史已答问题不是新请求", output)
+        self.assertNotIn("明确问题或有帮助时参与", output)
+        self.assertNotIn("只输出 yes 或 no", output)
+
     def test_decision_and_reply_share_previous_window_sources(self):
         records = [message(7, "current unique question")]
         previous = [message(6, "previous bot offered help", "assistant")]

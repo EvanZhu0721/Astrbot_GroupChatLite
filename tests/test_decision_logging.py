@@ -71,6 +71,55 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.log.info.assert_not_called()
         self.log.warning.assert_not_called()
 
+    async def test_custom_rules_reach_system_prompt_with_fixed_chinese_protocol(self):
+        self.cfg.decision_prompt = "优先参与轻松闲聊，不必等待问题。CUSTOM_STYLE"
+        self.assertTrue(await self.decide())
+        prompt = self.provider.text_chat.await_args.kwargs["system_prompt"]
+        self.assertTrue(prompt.startswith(self.cfg.decision_prompt))
+        self.assertTrue(prompt.endswith(runtime.DECISION_OUTPUT_PROTOCOL))
+        self.assertIn("简体中文", prompt)
+        self.assertIn("yes或no", prompt)
+        self.assertIn("不调用工具", prompt)
+        self.assertNotIn(
+            "明确问题或有帮助时参与",
+            self.provider.text_chat.await_args.kwargs["prompt"],
+        )
+        self.provider.text_chat.assert_awaited_once()
+
+    async def test_blank_rules_use_default_without_extra_requests(self):
+        for value in ("", "   "):
+            self.cfg.decision_prompt = value
+            self.provider.text_chat.reset_mock()
+            self.assertTrue(await self.decide())
+            self.assertEqual(
+                self.provider.text_chat.await_args.kwargs["system_prompt"],
+                runtime.DECISION_PROMPT,
+            )
+            self.provider.text_chat.assert_awaited_once()
+
+    async def test_effective_group_rules_are_isolated_in_actual_provider_calls(self):
+        self.plugin.settings = runtime.Settings.from_mapping(
+            {
+                "group_ids": ["-10", "-20"],
+                "decision_prompt": "GLOBAL_RULE",
+                "group_overrides": [
+                    {"group_id": "-10", "decision_prompt": "GROUP_TEN_RULE"},
+                    {"group_id": "-20", "decision_prompt": ""},
+                ],
+            }
+        )
+        self.plugin._settings = types.MethodType(
+            runtime.AstrbotGroupChatLite._settings, self.plugin
+        )
+        for group, expected in (("-10", "GROUP_TEN_RULE"), ("-20", "GLOBAL_RULE")):
+            self.provider.text_chat.return_value = types.SimpleNamespace(
+                completion_text="yes"
+            )
+            self.assertTrue(await self.plugin._decide(Event(1, group=group), []))
+            prompt = self.provider.text_chat.await_args.kwargs["system_prompt"]
+            self.assertTrue(prompt.startswith(expected))
+            self.assertTrue(prompt.endswith(runtime.DECISION_OUTPUT_PROTOCOL))
+
     async def test_enabled_logs_explicit_field_and_keeps_request_unchanged(self):
         self.cfg.decision_log_reasoning = True
         self.assertTrue(await self.decide("模型显式返回的简短推理"))

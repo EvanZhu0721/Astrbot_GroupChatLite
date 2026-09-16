@@ -20,6 +20,62 @@ def defaults(items):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_decision_prompt_default_and_schema(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        field = schema["advanced"]["items"]["decision_prompt"]
+        self.assertEqual(field["type"], "text")
+        self.assertEqual(field["default"], module.DEFAULT_DECISION_PROMPT)
+        for config in ({}, defaults(schema), {"advanced": {"decision_prompt": " \n"}}):
+            self.assertEqual(
+                Settings.from_mapping(config).decision_prompt,
+                module.DEFAULT_DECISION_PROMPT,
+            )
+
+    def test_decision_prompt_group_inheritance_and_exact_override(self):
+        settings = Settings.from_mapping(
+            {
+                "advanced": {"decision_prompt": " 全局规则 "},
+                "group_overrides": [
+                    {"group_id": "room", "decision_prompt": " \n"},
+                    {
+                        "group_id": "tg:GroupMessage:room#2",
+                        "decision_prompt": " 本话题规则 ",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(settings.decision_prompt, "全局规则")
+        self.assertEqual(
+            settings.effective("tg:GroupMessage:room", "room").decision_prompt,
+            "全局规则",
+        )
+        self.assertEqual(
+            settings.effective("tg:GroupMessage:room#2", "room").decision_prompt,
+            "本话题规则",
+        )
+
+    def test_decision_prompt_strict_type_and_length(self):
+        for value in (None, False, 1, [], "x" * 8001):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaises(ValueError):
+                    Settings.from_mapping({"advanced": {"decision_prompt": value}})
+                with self.assertRaises(ValueError):
+                    Settings.from_mapping(
+                        {
+                            "group_overrides": [
+                                {"group_id": "room", "decision_prompt": value}
+                            ]
+                        }
+                    )
+        self.assertEqual(
+            len(
+                Settings.from_mapping(
+                    {"advanced": {"decision_prompt": "x" * 8000}}
+                ).decision_prompt
+            ),
+            8000,
+        )
+
     def test_image_defaults_and_group_overrides(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         settings = Settings.from_mapping(defaults(schema))
