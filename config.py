@@ -3,14 +3,40 @@
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping
 import math
+import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-DEFAULT_DECISION_PROMPT = (
+LEGACY_DECISION_PROMPT = (
     "你是群聊读空气助手，只判断此刻是否适合参与，不回答群消息。"
     "以本轮触发消息和待处理消息为重点，结合当前窗口、上一窗口摘要及少量原文理解承接关系。"
     "历史已回答的问题不是新的请求，不要因为旧话题仍在上下文中就再次参与。"
     "有人明确提问、请求帮助、提到AI/LLM相关话题时, 延续与你的对话，或你能提供具体帮助时，可以回应；"
     "他人之间的对话、通知、重复内容或已经解决的问题，可以选择静默."
 )
+DEFAULT_DECISION_PROMPT = (
+    "你是群聊读空气评分助手，只评估此刻参与当前对话的语义适宜程度，不回答群消息。"
+    "以本轮触发消息和待处理消息为重点，结合当前窗口、上一窗口摘要及少量原文理解承接关系。"
+    "历史已回答的问题不是新的请求，不要因为旧话题仍在上下文中就再次参与。"
+    "有人明确提问、请求帮助、提到AI/LLM相关话题、延续与你的对话，或你能提供具体帮助时，提高基础分；"
+    "他人之间的对话、通知、重复内容或已经解决的问题，降低基础分。"
+    "不要计算消息频率、夜间时段、最近成功回复对象奖励或引用链奖励，这些由程序另行加减，避免重复计分。"
+    "输出JSON对象，score为0到1的基础分，reason为最多一句简短理由。"
+)
+
+SCORE_LIMITS = {
+    "score_threshold": (0, 1, False),
+    "score_quote_bonus": (0, 1, False),
+    "score_quote_decay": (0, 1, False),
+    "score_recent_bonus": (0, 1, False),
+    "score_recent_seconds": (1, 3600, False),
+    "score_high_penalty": (0, 1, False),
+    "score_high_count": (2, 1000, True),
+    "score_low_bonus": (0, 1, False),
+    "score_low_count": (0, 999, True),
+    "score_frequency_seconds": (1, 3600, False),
+    "score_night_bonus": (0, 1, False),
+}
+SCORE_STRINGS = {"score_timezone", "score_night_start", "score_night_end"}
 
 PRESETS = {
     "small": dict(
@@ -39,6 +65,7 @@ PRESETS = {
     ),
 }
 LIMITS = {
+    **SCORE_LIMITS,
     "max_context_images": (0, 8, True),
     "image_retention_minutes": (1, 1440, False),
     "max_merge_wait_seconds": (0, 30, False),
@@ -68,6 +95,9 @@ ALIASES = {
     "summary_timeout_seconds": "summary_timeout",
 }
 GROUP_FIELDS = {
+    *SCORE_LIMITS,
+    *SCORE_STRINGS,
+    "scoring",
     "decision_use_persona",
     "decision_prompt",
     "image_input_enabled",
@@ -96,7 +126,29 @@ def _overrides(raw, group=False):
             continue
         if group and key not in GROUP_FIELDS:
             raise ValueError("Unsupported group override")
-        if key in LIMITS:
+        if key == "scoring":
+            if not isinstance(value, Mapping) or any(
+                k not in {*SCORE_LIMITS, *SCORE_STRINGS} for k in value
+            ):
+                raise ValueError("scoring must contain only score fields")
+            result.update(_overrides(value, group))
+        elif key in SCORE_STRINGS:
+            if not isinstance(value, str):
+                raise ValueError(f"{key} must be text")
+            value = value.strip()
+            if not value:
+                continue
+            if key == "score_timezone":
+                try:
+                    ZoneInfo(value)
+                except (ZoneInfoNotFoundError, ValueError) as exc:
+                    raise ValueError(
+                        "Invalid score_timezone or missing IANA tzdata"
+                    ) from exc
+            elif not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError(f"{key} must use HH:MM")
+            result[key] = value
+        elif key in LIMITS:
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f"{key} must be finite numeric")
             if value == -1:
@@ -111,6 +163,8 @@ def _overrides(raw, group=False):
                     "decision_prompt must be text of at most 8000 characters"
                 )
             value = value.strip()
+            if value == LEGACY_DECISION_PROMPT:
+                value = DEFAULT_DECISION_PROMPT
             if value:
                 result[key] = value
             elif not group:
@@ -158,6 +212,20 @@ def _overrides(raw, group=False):
 
 @dataclass(frozen=True)
 class Settings:
+    score_threshold: float = 0.7
+    score_quote_bonus: float = 1.0
+    score_quote_decay: float = 0.5
+    score_recent_bonus: float = 0.2
+    score_recent_seconds: float = 120.0
+    score_high_penalty: float = 0.1
+    score_high_count: int = 6
+    score_low_bonus: float = 0.2
+    score_low_count: int = 1
+    score_frequency_seconds: float = 60.0
+    score_night_bonus: float = 0.1
+    score_timezone: str = "Asia/Hong_Kong"
+    score_night_start: str = "00:00"
+    score_night_end: str = "07:00"
     enabled: bool = True
     image_input_enabled: bool = True
     max_context_images: int = 4
@@ -194,6 +262,16 @@ class Settings:
     _global: dict = field(default_factory=dict, repr=False, compare=False)
     _groups: tuple = field(default_factory=tuple, repr=False, compare=False)
 
+    def __post_init__(self):
+        if self.score_low_count >= self.score_high_count:
+            raise ValueError("score_low_count must be less than score_high_count")
+        if not self.enabled:
+            return
+        try:
+            ZoneInfo(self.score_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("Invalid score_timezone or missing IANA tzdata") from exc
+
     @property
     def idle_seconds(self):
         return self.idle_minutes * 60
@@ -226,6 +304,7 @@ class Settings:
                 "selected_groups",
                 "preset",
                 "advanced",
+                "scoring",
                 "group_overrides",
                 "auto_reply",
                 "reply_mode",
@@ -237,6 +316,7 @@ class Settings:
             }
             | LIMITS.keys()
             | ALIASES.keys()
+            | SCORE_STRINGS
         )
         if any(key not in allowed for key in config):
             raise ValueError("Unknown configuration field")
@@ -274,10 +354,12 @@ class Settings:
         if not isinstance(preset, str) or preset not in PRESETS:
             raise ValueError("Invalid preset")
         values = _overrides(config.get("advanced", {}))
+        values.update(_overrides({"scoring": config.get("scoring", {})}))
         legacy = {
             k: v
             for k, v in config.items()
             if k in LIMITS
+            or k in SCORE_STRINGS
             or k in ALIASES
             or k
             in {
@@ -316,7 +398,7 @@ class Settings:
             entries.append((target.strip(), profile, _overrides(e, True)))
         resolved = dict(PRESETS[preset])
         resolved.update(values)
-        return cls(
+        settings = cls(
             enabled=enabled,
             group_ids=tuple(dict.fromkeys(g.strip() for g in [*groups, *selected])),
             group_discovery_enabled=discovery,
@@ -326,3 +408,6 @@ class Settings:
             _groups=tuple(entries),
             **resolved,
         )
+        for target, _, _ in entries:
+            settings.effective(target, target)
+        return settings

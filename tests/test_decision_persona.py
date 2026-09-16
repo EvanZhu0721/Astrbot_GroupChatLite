@@ -119,7 +119,7 @@ class DecisionPersonaTests(unittest.IsolatedAsyncioTestCase):
             ("-20", "BACKGROUND_B", "BACKGROUND_A"),
         ):
             self.provider.text_chat.return_value = types.SimpleNamespace(
-                completion_text="yes"
+                completion_text='{"score":0.9,"reason":"相关"}'
             )
             self.assertTrue(await self.plugin._decide(Event(1, group=group), []))
             prompt = self.provider.text_chat.await_args.kwargs["system_prompt"]

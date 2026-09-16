@@ -8,13 +8,21 @@ import test_runtime as support
 from test_runtime import Event, runtime
 
 
+class FakeClient:
+    def __init__(self, event):
+        self.event = event
+
+    async def send_message(self, **kwargs):
+        return await self.event.deliver(**kwargs)
+
+
 class SendingEvent(Event):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.receipt_id = 100
         self.fail = False
         self.swallow = False
-        self.client = types.SimpleNamespace(send_message=self.deliver)
+        self.client = FakeClient(self)
 
     async def deliver(self, **kwargs):
         if self.fail:
@@ -78,7 +86,9 @@ class ExternalHistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_ordinary_decision_receives_external_exchange(self):
         provider = types.SimpleNamespace(
             text_chat=AsyncMock(
-                return_value=types.SimpleNamespace(completion_text="no")
+                return_value=types.SimpleNamespace(
+                    completion_text='{"score":0,"reason":"不参与"}'
+                )
             )
         )
         self.plugin._provider = AsyncMock(return_value=provider)
@@ -164,6 +174,35 @@ class ExternalHistoryTests(unittest.IsolatedAsyncioTestCase):
         event.stop_event()
         await event.send("answer")
         self.assertEqual(self.records(event), [])
+
+    async def test_scoring_tracks_success_only_and_deduplicates_human_arrival(self):
+        event = SendingEvent(1)
+        await self.plugin.observe_external_replies(event)
+        await self.plugin.observe_external_replies(event)
+        state = self.plugin._scoring_state
+        before = state.snapshot(event.unified_msg_origin, "1", "human")
+        self.assertEqual(before.arrival_count, 1)
+        self.assertFalse(before.recent_target)
+        event.fail, event.swallow = True, True
+        await event.send("unsent")
+        self.assertFalse(
+            state.snapshot(event.unified_msg_origin, "1", "human").recent_target
+        )
+        event.fail = False
+        await event.send("delivered")
+        self.assertTrue(
+            state.snapshot(event.unified_msg_origin, "1", "human").recent_target
+        )
+        self.assertFalse(
+            state.snapshot(event.unified_msg_origin, "1", "another").recent_target
+        )
+        self.assertFalse(
+            state.snapshot("bot:GroupMessage:-20", "1", "human").recent_target
+        )
+        self.assertEqual(await self.consume(event), [])
+        self.assertEqual(
+            state.snapshot(event.unified_msg_origin, "1", "human").arrival_count, 1
+        )
 
     async def test_late_response_updates_original_window_and_invalidates_summary(self):
         event = SendingEvent(1)

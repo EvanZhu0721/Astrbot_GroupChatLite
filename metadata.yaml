@@ -1,7 +1,7 @@
 name: Astrbot_GroupChatLite
 display_name: Astrbot_GroupChatLite
 desc: DEMO
-version: v0.1.4
+version: v0.2.0
 author: EvanZhu0721
 repo: https://github.com/EvanZhu0721/Astrbot_GroupChatLite
 astrbot_version: ">=4.28.0-beta.1"

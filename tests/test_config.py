@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
+from zoneinfo import ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("gcl_config_test", ROOT / "config.py")
@@ -20,6 +22,95 @@ def defaults(items):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_timezone_data_allows_disabled_fallback_only(self):
+        with patch.object(
+            module, "ZoneInfo", side_effect=ZoneInfoNotFoundError("missing")
+        ):
+            self.assertFalse(Settings(enabled=False).enabled)
+            with self.assertRaisesRegex(ValueError, "tzdata"):
+                Settings.from_mapping({})
+
+    def test_enabled_group_timezone_is_validated(self):
+        real_zoneinfo = module.ZoneInfo
+
+        def missing_group_zone(value):
+            if value == "Europe/Paris":
+                raise ZoneInfoNotFoundError("missing")
+            return real_zoneinfo(value)
+
+        with patch.object(module, "ZoneInfo", side_effect=missing_group_zone):
+            with self.assertRaisesRegex(ValueError, "tzdata"):
+                Settings.from_mapping(
+                    {
+                        "group_overrides": [
+                            {
+                                "group_id": "room",
+                                "scoring": {"score_timezone": "Europe/Paris"},
+                            }
+                        ]
+                    }
+                )
+
+    def test_scoring_defaults_schema_and_group_inheritance(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        settings = Settings.from_mapping(defaults(schema))
+        self.assertEqual(settings.score_threshold, 0.7)
+        self.assertEqual(settings.score_timezone, "Asia/Hong_Kong")
+        group = defaults(schema["group_overrides"]["templates"]["group"]["items"])
+        group["group_id"] = "room"
+        group["scoring"]["score_quote_bonus"] = 0
+        settings = Settings.from_mapping(
+            {"scoring": {"score_recent_bonus": 0.4}, "group_overrides": [group]}
+        )
+        effective = settings.effective("umo", "room")
+        self.assertEqual(effective.score_recent_bonus, 0.4)
+        self.assertEqual(effective.score_quote_bonus, 0.0)
+
+    def test_scoring_rejects_invalid_timezone_clock_ranges(self):
+        for key, value in (
+            ("score_timezone", "Not/AZone"),
+            ("score_night_start", "24:00"),
+            ("score_night_end", "7:00"),
+            ("score_threshold", float("nan")),
+            ("score_high_penalty", float("inf")),
+            ("score_quote_decay", 1.1),
+            ("score_recent_bonus", True),
+            ("score_frequency_seconds", 0),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                Settings.from_mapping({"scoring": {key: value}})
+
+    def test_scoring_group_conflicting_thresholds_rejected_early(self):
+        with self.assertRaises(ValueError):
+            Settings.from_mapping(
+                {
+                    "scoring": {"score_low_count": 5},
+                    "group_overrides": [
+                        {"group_id": "room", "scoring": {"score_high_count": 5}}
+                    ],
+                }
+            )
+
+    def test_legacy_default_prompt_migrates_but_custom_does_not(self):
+        legacy = module.LEGACY_DECISION_PROMPT
+        settings = Settings.from_mapping({"advanced": {"decision_prompt": legacy}})
+        self.assertEqual(settings.decision_prompt, module.DEFAULT_DECISION_PROMPT)
+        self.assertIn("score", settings.decision_prompt)
+        custom = legacy + "我自定义的规则"
+        self.assertEqual(
+            Settings.from_mapping(
+                {"advanced": {"decision_prompt": custom}}
+            ).decision_prompt,
+            custom,
+        )
+        settings = Settings.from_mapping(
+            {"group_overrides": [{"group_id": "room", "decision_prompt": legacy}]}
+        )
+        self.assertEqual(
+            settings.effective("umo", "room").decision_prompt,
+            module.DEFAULT_DECISION_PROMPT,
+        )
+
     def test_decision_persona_defaults_and_group_switches(self):
         self.assertTrue(Settings.from_mapping({}).decision_use_persona)
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))

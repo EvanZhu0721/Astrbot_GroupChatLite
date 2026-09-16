@@ -204,7 +204,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.context = Context()
         self.plugin = runtime.AstrbotGroupChatLite(
-            self.context, {"group_ids": ["-10", "-20"], "merge_wait_seconds": 0.01}
+            self.context,
+            {
+                "group_ids": ["-10", "-20"],
+                "merge_wait_seconds": 0.01,
+                "decision_cooldown_seconds": 0,
+                "reply_cooldown_seconds": 0,
+            },
         )
         self.plugin.store = runtime.Store(Path(self.temp.name) / "chat.sqlite3")
         self.now = 1000.0
@@ -322,6 +328,144 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.consume(Event(2, direct=True)), [])
         self.context.stars[0].activated = False
         self.assertEqual(len(await self.consume(Event(3, direct=True))), 1)
+
+    async def test_cooldown_retains_only_latest_without_holding_lock(self):
+        self.plugin.settings = dataclasses.replace(
+            self.plugin.settings,
+            merge_wait_seconds=0,
+            max_merge_wait_seconds=0,
+            decision_cooldown_seconds=0.12,
+            reply_cooldown_seconds=0,
+        )
+        event = Event(1)
+        room = self.plugin._rooms.setdefault(event.unified_msg_origin, runtime.Room())
+        room.last_decision = self.plugin._monotonic()
+        older = asyncio.create_task(self.consume(event))
+        await asyncio.sleep(0.01)
+        self.assertFalse(room.lock.locked())
+        self.assertEqual(room.consumed_revision, 0)
+        newer = asyncio.create_task(self.consume(Event(2)))
+        results = await asyncio.wait_for(asyncio.gather(older, newer), 1)
+        self.assertEqual([len(result) for result in results], [0, 1])
+        self.plugin._decide.assert_awaited_once()
+        self.assertEqual(room.pending, {})
+
+    async def test_reference_is_independent_but_scores_and_mention_does_not(self):
+        quote = Event(1)
+        quote.message_obj.message = [Reply(sender_id="bot", id="90", chain=[])]
+        quote.message_obj.raw_message.message.reply_to_message = types.SimpleNamespace(
+            message_id=90, from_user=types.SimpleNamespace(id=123, username="bot")
+        )
+        captured = []
+
+        async def decide(event, messages):
+            captured.append(dict(event.get_extra(runtime.SNAPSHOT)["score_features"]))
+            return True
+
+        self.plugin._decide = AsyncMock(side_effect=decide)
+        self.assertEqual(len(await self.consume(quote)), 1)
+        self.plugin._decide.assert_awaited_once()
+        self.assertEqual(captured[0]["reply_hops"], 1)
+        self.assertEqual(len(await self.consume(Event(2, direct=True))), 1)
+        self.plugin._decide.assert_awaited_once()
+
+    async def test_quote_remains_independent_when_later_ordinary_arrives(self):
+        quote = Event(101)
+        quote.message_obj.message = [Reply(sender_id="bot", id="900", chain=[])]
+        ordinary = Event(102)
+        first, second = await asyncio.gather(
+            self.consume(quote), self.consume(ordinary)
+        )
+        self.assertEqual([len(first), len(second)], [1, 1])
+        self.assertEqual(self.plugin._decide.await_count, 2)
+
+    async def test_pending_features_exclude_old_processed_and_freeze_batch(self):
+        self.plugin.settings = dataclasses.replace(
+            self.plugin.settings,
+            merge_wait_seconds=0.02,
+            max_merge_wait_seconds=0.04,
+            decision_cooldown_seconds=0,
+            reply_cooldown_seconds=0,
+        )
+        await self.consume(Event(1, direct=True))
+        seen = []
+
+        async def decide(event, messages):
+            seen.append(dict(event.get_extra(runtime.SNAPSHOT)["score_features"]))
+            return False
+
+        self.plugin._decide = decide
+        first = asyncio.create_task(self.consume(Event(2)))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(self.consume(Event(3)))
+        await asyncio.gather(first, second)
+        self.assertEqual([entry["pending_count"] for entry in seen], [2])
+        await self.consume(Event(4))
+        self.assertEqual([entry["pending_count"] for entry in seen], [2, 1])
+
+    async def test_generated_text_without_receipt_is_not_a_successful_reply_target(
+        self,
+    ):
+        event = Event(1, direct=True)
+        await self.consume(event)
+        state = self.plugin._scoring_state.snapshot(
+            event.unified_msg_origin, "1", "human"
+        )
+        self.assertFalse(state.recent_target)
+        self.assertEqual(
+            self.plugin._rooms[event.unified_msg_origin].last_reply, -float("inf")
+        )
+
+    async def test_score_features_do_not_change_during_model_wait(self):
+        self.plugin.settings = dataclasses.replace(
+            self.plugin.settings, merge_wait_seconds=0, max_merge_wait_seconds=0
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+        frozen = []
+
+        async def decide(event, messages):
+            features = event.get_extra(runtime.SNAPSHOT)["score_features"]
+            frozen.append(dict(features))
+            if event.message_obj.message_id == "1":
+                entered.set()
+                await release.wait()
+                self.assertEqual(features, frozen[0])
+            return False
+
+        self.plugin._decide = decide
+        first = asyncio.create_task(self.consume(Event(1)))
+        await entered.wait()
+        second = asyncio.create_task(self.consume(Event(2)))
+        await asyncio.sleep(0)
+        self.now += 5
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual([f["pending_count"] for f in frozen], [1, 1])
+        self.assertEqual([f["recent_message_count"] for f in frozen], [1, 2])
+        self.assertEqual([f["now"] for f in frozen], [1000, 1005])
+
+    async def test_cooldown_expiry_and_cancel_clear_pending(self):
+        self.plugin.settings = dataclasses.replace(
+            self.plugin.settings,
+            merge_wait_seconds=0,
+            max_merge_wait_seconds=0,
+            decision_cooldown_seconds=1,
+            reply_cooldown_seconds=0,
+            stale_message_seconds=0.03,
+        )
+        event = Event(1)
+        room = self.plugin._rooms.setdefault(event.unified_msg_origin, runtime.Room())
+        room.last_decision = self.plugin._monotonic()
+        self.assertEqual(await asyncio.wait_for(self.consume(event), 1), [])
+        self.assertFalse(room.lock.locked())
+        self.assertEqual(room.pending, {})
+        task = asyncio.create_task(self.consume(Event(2)))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(room.lock.locked())
+        self.assertEqual(room.pending, {})
 
     async def test_debounce_merges_ordinary_but_keeps_direct(self):
         first = asyncio.create_task(self.consume(Event(1, "first")))

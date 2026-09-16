@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -31,13 +32,17 @@ from .context_builder import (
 from .store import Store
 from .media_cache import MediaCache
 from .send_observer import install_send_observer
+from .scoring import parse_model_score, score_decision
+from .scoring_state import ScoringState
 
 
 MARKER = "_groupchat_lite_request"
 SNAPSHOT = "_groupchat_lite_snapshot"
 OBSERVER = "_groupchat_lite_external_observer"
 DECISION_OUTPUT_PROTOCOL = (
-    "【固定输出协议】最终回答只能是小写yes或no，不解释，不调用工具。"
+    '【固定输出协议】只评估当前消息语义上的参与必要性，输出JSON：{"score":0.0,"reason":"简短中文理由"}。'
+    "score必须为0到1的数值。不计引用机器人、最近回复对象、消息频率、批次数量及夜间奖励，"
+    "这些由程序单独计算。不要输出yes/no，不调用工具。"
     "如果模型提供单独的可见推理字段，请使用简体中文；无需为此增加额外回答。"
 )
 DECISION_PROMPT = DEFAULT_DECISION_PROMPT + "\n\n" + DECISION_OUTPUT_PROTOCOL
@@ -59,6 +64,7 @@ class Room:
     pending_since: float | None = None
     latest_ordinary: int = 0
     consumed_revision: int = 0
+    pending: dict[int, float] = field(default_factory=dict)
 
 
 class AstrbotGroupChatLite(Star):
@@ -85,6 +91,7 @@ class AstrbotGroupChatLite(Star):
         self._monotonic = time.monotonic
         self._media = MediaCache(clock=lambda: self._monotonic())
         self._send_observers = weakref.WeakSet()
+        self._scoring_state = ScoringState(clock=lambda: self._monotonic())
 
     async def initialize(self):
         if self.store is None:
@@ -243,6 +250,9 @@ class AstrbotGroupChatLite(Star):
         return bool(re.match(r"^/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?(?:\s|$)", text or ""))
 
     def _is_direct(self, event):
+        return self._is_mention(event) or self._is_bot_reply(event)
+
+    def _is_mention(self, event):
         bot_id = str(event.get_self_id()).lstrip("@").casefold()
         for component in event.message_obj.message:
             if (
@@ -250,6 +260,11 @@ class AstrbotGroupChatLite(Star):
                 and str(component.qq).lstrip("@").casefold() == bot_id
             ):
                 return True
+        return False
+
+    def _is_bot_reply(self, event):
+        bot_id = str(event.get_self_id()).lstrip("@").casefold()
+        for component in event.message_obj.message:
             if (
                 isinstance(component, Reply)
                 and str(component.sender_id).casefold() == bot_id
@@ -452,6 +467,29 @@ class AstrbotGroupChatLite(Star):
             if message["id"] in vanished:
                 message["text"] += " [图片文件已失效，本次未提供；不能推断图像内容]"
 
+    def _observe_score_message(self, event):
+        raw = self._raw_message(event)
+        replied = getattr(raw, "reply_to_message", None)
+        author = getattr(replied, "from_user", None)
+        reply_id = getattr(replied, "message_id", None)
+        reply_sender = getattr(author, "id", None)
+        if reply_id is None:
+            for part in event.message_obj.message:
+                if isinstance(part, Reply):
+                    reply_id = getattr(part, "id", None)
+                    reply_sender = getattr(part, "sender_id", None)
+                    break
+        self._scoring_state.observe_message(
+            event.unified_msg_origin,
+            event.message_obj.message_id,
+            str(event.get_sender_id()),
+            reply_to_message_id=reply_id,
+            reply_to_sender_id=reply_sender,
+            reply_to_sender_username=getattr(author, "username", None),
+            bot_id=event.get_self_id(),
+            bot_username=event.get_self_id(),
+        )
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def observe_external_replies(self, event: AstrMessageEvent):
         """Observe ordinary plugin sends without claiming or answering the event."""
@@ -469,6 +507,7 @@ class AstrbotGroupChatLite(Star):
         source_id = self._source_id(event)
         if source_id is None:
             return
+        self._observe_score_message(event)
         umo = event.unified_msg_origin
         cfg = self._settings(umo, event.get_group_id())
         observed_at = self._clock()
@@ -484,7 +523,7 @@ class AstrbotGroupChatLite(Star):
         if any(isinstance(part, Image) for part in self._media_parts(event)):
             original["text"] += " [含图片]"
 
-        def should_record():
+        def should_observe():
             return (
                 self.store is not None
                 and not self._stopping
@@ -493,8 +532,25 @@ class AstrbotGroupChatLite(Star):
                 and self._in_scope(event)
                 and not self._is_bot_message(event)
                 and not self._activation_issue(event)
-                and not event.get_extra(MARKER)
             )
+
+        def should_record():
+            return should_observe() and not event.get_extra(MARKER)
+
+        def on_delivery(receipt, delivery_key, is_streaming):
+            if not should_observe():
+                return
+            self._scoring_state.record_delivery(
+                umo,
+                receipt.message_id,
+                target_message_id=event.message_obj.message_id,
+                target_sender_id=original["sender_id"],
+                bot_id=event.get_self_id(),
+                bot_username=event.get_self_id(),
+            )
+            room = self._rooms.get(umo)
+            if room is not None:
+                room.last_reply = self._monotonic()
 
         def on_success(text, delivery_key):
             if not should_record() or not isinstance(text, str) or not text.strip():
@@ -528,7 +584,13 @@ class AstrbotGroupChatLite(Star):
                 )
 
         try:
-            handle = install_send_observer(event, on_success, should_record)
+            handle = install_send_observer(
+                event,
+                on_success,
+                should_record,
+                on_delivery=on_delivery,
+                should_observe=should_observe,
+            )
             if handle is not None:
                 self._send_observers.add(handle)
                 event.set_extra(OBSERVER, handle)
@@ -536,6 +598,68 @@ class AstrbotGroupChatLite(Star):
             logger.warning(
                 "[GroupChatLite] 外部回复观察不可用（%s）。", type(exc).__name__
             )
+
+    @asynccontextmanager
+    async def _batch_lock(self, room, revision, independent, event, cfg, arrived):
+        """Wait outside the lock; only the newest ordinary candidate survives."""
+        acquired = False
+        try:
+            while not self._stopping and not event.is_stopped():
+                if not independent and (
+                    revision <= room.consumed_revision
+                    or revision != room.latest_ordinary
+                ):
+                    break
+                clock = self._monotonic()
+                ttl = getattr(cfg, "stale_message_seconds", 300)
+                if ttl > 0 and clock - arrived >= ttl:
+                    room.pending.pop(revision, None)
+                    break
+                deadline = (
+                    clock
+                    if independent
+                    else max(
+                        room.last_decision
+                        + getattr(cfg, "decision_cooldown_seconds", 0),
+                        room.last_reply + getattr(cfg, "reply_cooldown_seconds", 0),
+                    )
+                )
+                if deadline > clock:
+                    await asyncio.sleep(min(deadline - clock, 0.2))
+                    continue
+                await room.lock.acquire()
+                acquired = True
+                if ttl > 0 and self._monotonic() - arrived >= ttl:
+                    room.pending.pop(revision, None)
+                    room.lock.release()
+                    acquired = False
+                    break
+                if independent:
+                    break
+                if (
+                    revision != room.latest_ordinary
+                    or revision <= room.consumed_revision
+                ):
+                    room.lock.release()
+                    acquired = False
+                    break
+                clock = self._monotonic()
+                if (
+                    max(
+                        room.last_decision
+                        + getattr(cfg, "decision_cooldown_seconds", 0),
+                        room.last_reply + getattr(cfg, "reply_cooldown_seconds", 0),
+                    )
+                    > clock
+                ):
+                    room.lock.release()
+                    acquired = False
+                    continue
+                break
+            yield acquired and not self._stopping and not event.is_stopped()
+        finally:
+            if acquired:
+                room.lock.release()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=0)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -554,6 +678,7 @@ class AstrbotGroupChatLite(Star):
         event.call_llm = True
         if event.is_stopped() or getattr(event, "_has_send_oper", False):
             return
+        await self.observe_external_replies(event)
         source_id = self._source_id(event)
         if source_id is None or self.store is None:
             self._warn_once(
@@ -609,12 +734,15 @@ class AstrbotGroupChatLite(Star):
         room.revision += 1
         revision = room.revision
         room.last_arrival = self._monotonic()
+        arrived = room.last_arrival
+        mention = self._is_mention(event)
         direct = self._is_direct(event)
         if not direct and (
             not cfg.auto_reply or getattr(cfg, "reply_mode", "smart") == "mentions"
         ):
             return
         if not direct:
+            room.pending[revision] = arrived
             room.latest_ordinary = revision
             if room.pending_since is None:
                 room.pending_since = room.last_arrival
@@ -645,12 +773,18 @@ class AstrbotGroupChatLite(Star):
                     await asyncio.sleep(remaining)
                 if revision != room.latest_ordinary:
                     return
-            async with room.lock:
-                if self._stopping or (
-                    not direct
-                    and (
-                        revision <= room.consumed_revision
-                        or revision != room.latest_ordinary
+            async with self._batch_lock(
+                room, revision, direct, event, cfg, arrived
+            ) as ready:
+                if (
+                    not ready
+                    or self._stopping
+                    or (
+                        not direct
+                        and (
+                            revision <= room.consumed_revision
+                            or revision != room.latest_ordinary
+                        )
                     )
                 ):
                     return
@@ -662,22 +796,37 @@ class AstrbotGroupChatLite(Star):
                     window_id = saved["window"]["id"]
                     snapshot = self._context_snapshot(umo, window_id, cfg)
                     snapshot["current_input_message_id"] = saved["message"]["id"]
+                    ttl = getattr(cfg, "stale_message_seconds", 300)
+                    room.pending = {
+                        rev: stamp
+                        for rev, stamp in room.pending.items()
+                        if ttl <= 0 or self._monotonic() - stamp < ttl
+                    }
+                    state = self._scoring_state.snapshot(
+                        umo,
+                        event.message_obj.message_id,
+                        str(event.get_sender_id()),
+                        pending=1 if direct else len(room.pending),
+                        frequency_seconds=getattr(cfg, "score_frequency_seconds", 60),
+                        recent_seconds=getattr(cfg, "score_recent_seconds", 120),
+                    )
+                    snapshot["score_features"] = dict(
+                        reply_hops=state.reply_hops or None,
+                        recent_reply_target=state.recent_target,
+                        recent_message_count=state.arrival_count,
+                        pending_count=state.pending,
+                        now=self._clock(),
+                    )
                     event.set_extra(SNAPSHOT, snapshot)
                     messages = snapshot["messages"]
                     # Freeze this batch before any model awaits. Direct triggers
                     # remain independent events even if their records are visible.
-                    room.consumed_revision = room.revision
-                    room.pending_since = None
                     if not direct:
+                        room.consumed_revision = room.revision
+                        room.pending.clear()
+                        room.pending_since = None
+                    if not mention:
                         clock = self._monotonic()
-                        if clock - room.last_decision < getattr(
-                            cfg, "decision_cooldown_seconds", 0
-                        ):
-                            return
-                        if clock - room.last_reply < getattr(
-                            cfg, "reply_cooldown_seconds", 0
-                        ):
-                            return
                         room.last_decision = clock
                         if not await self._decide(event, messages):
                             return
@@ -728,13 +877,13 @@ class AstrbotGroupChatLite(Star):
                             finished,
                             finished,
                         )
-                        room.last_reply = self._monotonic()
                     logger.info("[GroupChatLite] 正式回复结束 window=%s", window_id)
                 finally:
                     room.active = False
                     event.set_extra(MARKER, None)
                     event.set_extra(SNAPSHOT, None)
         except asyncio.CancelledError:
+            room.pending.pop(revision, None)
             raise
         except Exception as exc:
             # Log the type only: provider exception strings may contain prompts/URLs.
@@ -851,19 +1000,26 @@ class AstrbotGroupChatLite(Star):
                 ),
                 timeout=cfg.decision_timeout,
             )
-            # Deliberately accept a single verdict, never scan prose for a stray 'yes'.
-            answer = (
-                (getattr(response, "completion_text", "") or "")
-                .strip()
-                .lower()
-                .rstrip(".。!")
+            parsed = parse_model_score(getattr(response, "completion_text", "") or "")
+            features = snapshot.get("score_features") or dict(
+                reply_hops=None,
+                recent_reply_target=False,
+                recent_message_count=0,
+                pending_count=len(messages),
+                now=self._clock(),
             )
-            decision = answer == "yes"
+            scoring = (
+                score_decision(parsed["score"], **features, cfg=cfg) if parsed else None
+            )
+            decision = bool(scoring and scoring["should_reply"])
             if getattr(cfg, "decision_log_reasoning", False):
                 reasoning = getattr(response, "reasoning_content", None)
                 has_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
                 payload = {
                     "decision": "yes" if decision else "no",
+                    "score_valid": parsed is not None,
+                    "score_reason": parsed["reason"] if parsed else "评分格式无效",
+                    "score": scoring,
                     "reasoning": reasoning[:4000]
                     if has_reasoning
                     else "未返回推理内容",
@@ -1234,6 +1390,8 @@ class AstrbotGroupChatLite(Star):
         self._handlers.clear()
         self._summary_jobs.clear()
         self._media.clear()
+        self._scoring_state.clear()
+        self._rooms.clear()
         if self.store is not None:
             self.store.close()
             self.store = None

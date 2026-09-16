@@ -31,7 +31,8 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.provider = types.SimpleNamespace(
             text_chat=AsyncMock(
                 return_value=types.SimpleNamespace(
-                    completion_text="yes", reasoning_content=None
+                    completion_text='{"score":0.9,"reason":"相关"}',
+                    reasoning_content=None,
                 )
             )
         )
@@ -198,7 +199,9 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
             if len(calls) == 1:
                 entered.set()
                 await release.wait()
-            return types.SimpleNamespace(completion_text="yes")
+            return types.SimpleNamespace(
+                completion_text='{"score":0.9,"reason":"相关"}'
+            )
 
         self.provider.text_chat = decide
         first = asyncio.create_task(self.consume(Event(1, "first")))
@@ -222,7 +225,9 @@ class MultimodalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def decide(**kwargs):
             self.assertEqual(kwargs["image_urls"], [photo.path])
             Path(photo.path).unlink()
-            return types.SimpleNamespace(completion_text="yes")
+            return types.SimpleNamespace(
+                completion_text='{"score":0.9,"reason":"相关"}'
+            )
 
         self.provider.text_chat = decide
         event = Event(1)

@@ -21,6 +21,9 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
             decision_log_reasoning=False,
         )
         self.plugin._settings = lambda *args: self.cfg
+        for name, value in vars(runtime.Settings()).items():
+            if name.startswith("score_"):
+                setattr(self.cfg, name, value)
         self.provider = types.SimpleNamespace(text_chat=AsyncMock())
         self.plugin._provider = AsyncMock(return_value=self.provider)
         self.log = Mock()
@@ -38,7 +41,9 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def decide(self, reasoning=None, verdict="yes"):
         self.provider.text_chat.return_value = types.SimpleNamespace(
-            completion_text=verdict,
+            completion_text=json.dumps(
+                {"score": 0.9 if verdict == "yes" else 0, "reason": "简短理由"}
+            ),
             reasoning_content=reasoning,
         )
         return await self.plugin._decide(
@@ -78,7 +83,7 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(prompt.startswith(self.cfg.decision_prompt))
         self.assertTrue(prompt.endswith(runtime.DECISION_OUTPUT_PROTOCOL))
         self.assertIn("简体中文", prompt)
-        self.assertIn("yes或no", prompt)
+        self.assertIn('"score"', prompt)
         self.assertIn("不调用工具", prompt)
         self.assertNotIn(
             "明确问题或有帮助时参与",
@@ -113,7 +118,7 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
         for group, expected in (("-10", "GROUP_TEN_RULE"), ("-20", "GLOBAL_RULE")):
             self.provider.text_chat.return_value = types.SimpleNamespace(
-                completion_text="yes"
+                completion_text='{"score":0.9,"reason":"相关"}'
             )
             self.assertTrue(await self.plugin._decide(Event(1, group=group), []))
             prompt = self.provider.text_chat.await_args.kwargs["system_prompt"]
@@ -149,6 +154,60 @@ class DecisionLoggingTests(unittest.IsolatedAsyncioTestCase):
                 "truncated": False,
             },
         )
+
+    async def test_invalid_score_is_not_rescued_by_quote_bonus(self):
+        event = Event(1)
+        event.set_extra(
+            runtime.SNAPSHOT,
+            {
+                "score_features": dict(
+                    reply_hops=1,
+                    recent_reply_target=True,
+                    recent_message_count=1,
+                    pending_count=1,
+                    now=1000,
+                )
+            },
+        )
+        for answer in (
+            "yes",
+            "0.8",
+            '{"score":true}',
+            '{"score":2}',
+            '{"score":NaN}',
+            '```json\n{"score":1}\n```',
+        ):
+            self.provider.text_chat.return_value = types.SimpleNamespace(
+                completion_text=answer
+            )
+            self.assertFalse(await self.plugin._decide(event, []))
+        self.assertEqual(self.provider.text_chat.await_count, 6)
+
+    async def test_logged_score_uses_frozen_program_features_and_short_reason(self):
+        self.cfg.decision_log_reasoning = True
+        event = Event(1)
+        event.set_extra(
+            runtime.SNAPSHOT,
+            {
+                "score_features": dict(
+                    reply_hops=2,
+                    recent_reply_target=False,
+                    recent_message_count=10,
+                    pending_count=3,
+                    now=1000,
+                )
+            },
+        )
+        self.provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text='{"score":0.4,"reason":"明确承接"}'
+        )
+        self.assertTrue(await self.plugin._decide(event, []))
+        payload = self.logged_payload()
+        self.assertEqual(payload["score_reason"], "明确承接")
+        self.assertEqual(payload["score"]["bonuses"]["quote"], 0.5)
+        self.assertEqual(payload["score"]["bonuses"]["high_frequency"], -0.1)
+        self.assertEqual(payload["score"]["bonuses"]["low_or_singleton"], 0)
+        self.assertEqual(payload["score"]["base_score"], 0.4)
 
     async def test_reasoning_is_capped_at_4000_characters(self):
         self.cfg.decision_log_reasoning = True
