@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import unicodedata
+import weakref
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -29,10 +30,12 @@ from .context_builder import (
 )
 from .store import Store
 from .media_cache import MediaCache
+from .send_observer import install_send_observer
 
 
 MARKER = "_groupchat_lite_request"
 SNAPSHOT = "_groupchat_lite_snapshot"
+OBSERVER = "_groupchat_lite_external_observer"
 DECISION_OUTPUT_PROTOCOL = (
     "【固定输出协议】最终回答只能是小写yes或no，不解释，不调用工具。"
     "如果模型提供单独的可见推理字段，请使用简体中文；无需为此增加额外回答。"
@@ -81,6 +84,7 @@ class AstrbotGroupChatLite(Star):
         self._clock = time.time
         self._monotonic = time.monotonic
         self._media = MediaCache(clock=lambda: self._monotonic())
+        self._send_observers = weakref.WeakSet()
 
     async def initialize(self):
         if self.store is None:
@@ -447,6 +451,91 @@ class AstrbotGroupChatLite(Star):
         for message in snapshot["messages"] + snapshot["previous_messages"]:
             if message["id"] in vanished:
                 message["text"] += " [图片文件已失效，本次未提供；不能推断图像内容]"
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    async def observe_external_replies(self, event: AstrMessageEvent):
+        """Observe ordinary plugin sends without claiming or answering the event."""
+        existing = event.get_extra(OBSERVER)
+        if existing in self._send_observers and getattr(existing, "active", False):
+            return
+        if (
+            not self._in_scope(event)
+            or self.store is None
+            or event.is_stopped()
+            or self._is_bot_message(event)
+            or self._activation_issue(event)
+        ):
+            return
+        source_id = self._source_id(event)
+        if source_id is None:
+            return
+        umo = event.unified_msg_origin
+        cfg = self._settings(umo, event.get_group_id())
+        observed_at = self._clock()
+        original = dict(
+            source_id=source_id,
+            text=self._text(event),
+            event_at=self._event_time(event, observed_at),
+            observed_at=observed_at,
+            sender_id=str(event.get_sender_id()),
+            sender_name=str(event.get_sender_name() or ""),
+            idle_seconds=cfg.idle_seconds,
+        )
+        if any(isinstance(part, Image) for part in self._media_parts(event)):
+            original["text"] += " [含图片]"
+
+        def should_record():
+            return (
+                self.store is not None
+                and not self._stopping
+                and event.unified_msg_origin == umo
+                and not event.is_stopped()
+                and self._in_scope(event)
+                and not self._is_bot_message(event)
+                and not self._activation_issue(event)
+                and not event.get_extra(MARKER)
+            )
+
+        def on_success(text, delivery_key):
+            if not should_record() or not isinstance(text, str) or not text.strip():
+                return
+            try:
+                # Both calls are synchronous; no reload or competing event can
+                # close this store between the scope check and the two writes.
+                saved = self.store.add_human(
+                    umo,
+                    original["source_id"],
+                    original["text"],
+                    original["event_at"],
+                    original["observed_at"],
+                    original["idle_seconds"],
+                    sender_id=original["sender_id"],
+                    sender_name=original["sender_name"],
+                )
+                now = self._clock()
+                self.store.add_bot(
+                    umo,
+                    saved["window"]["id"],
+                    "external:" + delivery_key,
+                    text,
+                    now,
+                    now,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GroupChatLite] 外部回复记录失败（%s），不影响发送。",
+                    type(exc).__name__,
+                )
+
+        try:
+            handle = install_send_observer(event, on_success, should_record)
+            if handle is not None:
+                self._send_observers.add(handle)
+                event.set_extra(OBSERVER, handle)
+        except Exception as exc:
+            logger.warning(
+                "[GroupChatLite] 外部回复观察不可用（%s）。", type(exc).__name__
+            )
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=0)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -1128,6 +1217,9 @@ class AstrbotGroupChatLite(Star):
 
     async def terminate(self):
         self._stopping = True
+        for observer in list(self._send_observers):
+            observer.detach()
+        self._send_observers.clear()
         current = asyncio.current_task()
         pending = [
             task
