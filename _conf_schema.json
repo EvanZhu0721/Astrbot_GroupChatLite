@@ -1,0 +1,47 @@
+{
+  "enabled": {"type":"bool","default":true,"description":"启用插件"},
+  "group_discovery_enabled":{"type":"bool","default":true,"description":"自动发现候选群／话题","hint":"仅插件总开关开启时发现候选；不会自动选择或接管新群。"},
+  "selected_groups":{"type":"list","options":[],"labels":[],"default":[],"description":"选择已发现的群／话题","hint":"收到新群消息后，重新打开配置页刷新；新发现群不会自动接管。与手填名单并集生效。"},
+  "group_ids": {"type":"list","default":[],"description":"接管的 Telegram 群 ID 精确名单","hint":"空名单不接管任何群。禁止通配符；按群覆盖不会自动加入名单。"},
+  "preset": {"type":"string","default":"balanced","options":["small","balanced","busy"],"description":"群聊场景","hint":"small：慢节奏小群；balanced：常规群；busy：繁忙群，延长合并与冷却。高级数值 -1 跟随场景。"},
+  "group_overrides": {
+    "type":"template_list","default":[],"description":"按群自定义（可选）",
+    "templates":{"group":{"name":"群 / 话题规则","items":{
+      "group_id":{"type":"string","default":"","description":"精确群 ID 或完整会话 UMO","hint":"完整 UMO 优先于群规则；此处不会扩大接管名单。添加规则后必须填写。"},
+      "preset":{"type":"string","default":"inherit","options":["inherit","small","balanced","busy"],"description":"场景；inherit 跟随全局"},
+      "reply_mode":{"type":"string","default":"inherit","options":["inherit","smart","mention_only"],"description":"参与方式","hint":"smart 自行判断普通消息；mention_only 只响应明确唤醒。"},
+      "idle_minutes":{"type":"float","default":-1,"description":"闲置几分钟切换窗口（-1 继承）"},
+      "merge_wait_seconds":{"type":"float","default":-1,"description":"短消息合并等待秒数（-1 继承，0 关闭）"},
+      "decision_cooldown_seconds":{"type":"float","default":-1,"description":"普通消息判断冷却秒数（-1 继承）"},
+      "reply_cooldown_seconds":{"type":"float","default":-1,"description":"普通回复冷却秒数（-1 继承）"},
+      "context_max_chars":{"type":"int","default":-1,"description":"背景字符预算（-1 继承，2000–64000）"},
+      "history_max_messages":{"type":"int","default":-1,"description":"当前窗口最多取几条原文（-1 继承，1–200）"},
+      "bridge_messages":{"type":"int","default":-1,"description":"上一窗口桥接条数（-1 继承，0 关闭，最多 8）"}
+    }}}
+  },
+  "advanced":{"type":"object","description":"高级设置（可选）","hint":"所有数值 -1 采用场景/默认值；0 仅用于支持关闭的项目。群显式值 > 全局显式值 > 群场景 > 全局场景。冷却不限制明确 @。","items":{
+    "reply_mode":{"type":"string","default":"inherit","options":["inherit","smart","mention_only"],"description":"参与方式；默认自行判断"},
+    "idle_minutes":{"type":"float","default":-1,"description":"切窗闲置分钟（1–1440）"},
+    "merge_wait_seconds":{"type":"float","default":-1,"description":"短消息合并等待秒数（0–10）"},
+    "max_merge_wait_seconds":{"type":"float","default":-1,"description":"合并最长等待秒数（0–30，默认 8）","hint":"繁忙群不会因持续新消息无限等待；运行时至少为合并等待值。"},
+    "decision_cooldown_seconds":{"type":"float","default":-1,"description":"普通消息判断冷却秒数（0–3600）"},
+    "reply_cooldown_seconds":{"type":"float","default":-1,"description":"普通回复冷却秒数（0–3600）"},
+    "history_max_messages":{"type":"int","default":-1,"description":"当前窗口原文条数（1–200）"},
+    "context_max_chars":{"type":"int","default":-1,"description":"上下文字符预算（2000–64000）"},
+    "bridge_messages":{"type":"int","default":-1,"description":"上一窗口原文桥接条数（0–8）"},
+    "summary_enabled":{"type":"bool","default":true,"description":"为结束窗口生成摘要"},
+    "summary_min_messages":{"type":"int","default":-1,"description":"生成摘要最少消息数（1–200，默认 4）"},
+    "summary_max_chars":{"type":"int","default":-1,"description":"摘要输入字符预算（2000–64000，默认 12000）"},
+    "summary_output_chars":{"type":"int","default":-1,"description":"摘要输出字符上限（100–4000，默认 500）"},
+    "summary_timeout":{"type":"float","default":-1,"description":"摘要超时秒数（1–180，默认 45）"},
+    "summary_retries":{"type":"int","default":-1,"description":"摘要额外重试次数（0–2，默认 1）"},
+    "summary_provider_id":{"type":"string","default":"","description":"摘要模型提供商 ID；空使用当前会话模型"},
+    "decision_max_chars":{"type":"int","default":-1,"description":"判断输入字符预算（512–16000，默认 4000）"},
+    "decision_timeout":{"type":"float","default":-1,"description":"判断超时秒数（1–120，默认 20）"},
+    "decision_provider_id":{"type":"string","default":"","description":"判断模型提供商 ID；空使用当前会话模型"},
+    "decision_log_reasoning":{"type":"bool","default":false,"description":"记录判断模型推理（默认关闭）","hint":"开启后将判断模型接口返回的推理内容及最终判定写入服务端日志；未返回时提示无推理；不会发到群聊。推理最多记录 4000 字符，超出截断，不会额外请求推理。"},
+    "history_tool_limit":{"type":"int","default":-1,"description":"历史工具单次记录上限（1–200，默认 20）"},
+    "history_tool_max_chars":{"type":"int","default":-1,"description":"历史工具输出字符上限（512–32000，默认 8000）"},
+    "stale_message_seconds":{"type":"float","default":-1,"description":"迟到消息阈值秒数（10–86400，默认 300）","hint":"太旧消息仅保存，不作为新的对话触发。"}
+  }}
+}
