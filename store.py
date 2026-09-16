@@ -50,6 +50,21 @@ class Store:
             CREATE INDEX IF NOT EXISTS discovered_group_recency
                 ON discovered_groups(last_seen DESC,umo);
         """)
+        # Older databases retain every row; absent relationship evidence stays empty.
+        columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(messages)")
+        }
+        with self.connection:
+            for name in (
+                "reply_to_message_id",
+                "reply_to_sender_id",
+                "response_to_message_id",
+                "response_to_sender_id",
+            ):
+                if name not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                    )
 
     def close(self):
         self.connection.close()
@@ -190,9 +205,13 @@ class Store:
         observed_at,
         sender_id="",
         sender_name="",
+        reply_to_message_id="",
+        reply_to_sender_id="",
+        response_to_message_id="",
+        response_to_sender_id="",
     ):
         cur = self.connection.execute(
-            "INSERT INTO messages(umo,window_id,source_message_id,role,text,event_at,observed_at,sender_id,sender_name) VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(umo,window_id,source_message_id,role,text,event_at,observed_at,sender_id,sender_name,reply_to_message_id,reply_to_sender_id,response_to_message_id,response_to_sender_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 umo,
                 window_id,
@@ -203,6 +222,10 @@ class Store:
                 observed_at,
                 str(sender_id),
                 str(sender_name),
+                str(reply_to_message_id or ""),
+                str(reply_to_sender_id or ""),
+                str(response_to_message_id or ""),
+                str(response_to_sender_id or ""),
             ),
         )
         self.connection.execute(
@@ -229,6 +252,8 @@ class Store:
         *,
         sender_id="",
         sender_name="",
+        reply_to_message_id="",
+        reply_to_sender_id="",
     ):
         """Assign by source time; delayed events cannot advance a newer window."""
         event_at, observed_at = self._number(event_at), self._number(observed_at)
@@ -294,9 +319,26 @@ class Store:
                 observed_at,
                 sender_id,
                 sender_name,
+                reply_to_message_id,
+                reply_to_sender_id,
             )
 
-    def add_bot(self, umo, window_id, source_message_id, text, event_at, observed_at):
+    def add_bot(
+        self,
+        umo,
+        window_id,
+        source_message_id,
+        text,
+        event_at,
+        observed_at,
+        *,
+        sender_id="",
+        sender_name="",
+        reply_to_message_id="",
+        reply_to_sender_id="",
+        response_to_message_id="",
+        response_to_sender_id="",
+    ):
         """Persist final output in its originating window, even after that window closes."""
         event_at, observed_at = self._number(event_at), self._number(observed_at)
         if not umo or source_message_id is None or not isinstance(text, str):
@@ -316,6 +358,12 @@ class Store:
                 text,
                 event_at,
                 observed_at,
+                sender_id,
+                sender_name,
+                reply_to_message_id,
+                reply_to_sender_id,
+                response_to_message_id,
+                response_to_sender_id,
             )
 
     def list_open_windows(self, limit=200):

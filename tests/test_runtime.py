@@ -242,6 +242,83 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         return requests
 
+    async def test_raw_identity_and_true_reply_are_stored(self):
+        event = Event(900, direct=True)
+        event.get_sender_name = lambda: "Unknown"
+        raw = event.message_obj.raw_message.message
+        raw.from_user = types.SimpleNamespace(
+            id=42, full_name="Alice Example", is_bot=False
+        )
+        raw.reply_to_message = types.SimpleNamespace(
+            message_id=899, from_user=types.SimpleNamespace(id=77)
+        )
+        await self.consume(event)
+        window = self.plugin.store.active_window(event.unified_msg_origin)
+        human, bot = self.plugin.store.window_messages(
+            event.unified_msg_origin, window["id"]
+        )
+        self.assertEqual(human["sender_id"], "42")
+        self.assertEqual(human["sender_name"], "Alice Example")
+        self.assertEqual(human["reply_to_message_id"], "899")
+        self.assertEqual(human["reply_to_sender_id"], "77")
+        # A generated final without a Telegram receipt is not a confirmed response link.
+        self.assertEqual(bot["response_to_sender_id"], "")
+
+    async def test_anonymous_chat_identity_and_topic_root_are_not_person_reply(self):
+        event = Event(901)
+        raw = event.message_obj.raw_message.message
+        raw.sender_chat = types.SimpleNamespace(id=-900, title="Anonymous group")
+        raw.is_topic_message = True
+        raw.message_thread_id = 100
+        raw.reply_to_message = types.SimpleNamespace(
+            message_id=100, from_user=types.SimpleNamespace(id=77)
+        )
+        identity = self.plugin._message_identity(event)
+        self.assertEqual(identity["sender_id"], "-900")
+        self.assertEqual(identity["sender_name"], "Anonymous group")
+        self.assertEqual(identity["reply_to_message_id"], "")
+        self.assertEqual(identity["reply_to_sender_id"], "")
+
+    async def test_unknown_display_name_falls_back_to_stable_sender_id(self):
+        event = Event(902)
+        event.get_sender_name = lambda: "Unknown"
+        self.assertEqual(self.plugin._message_identity(event)["sender_name"], "human")
+
+    async def test_successful_multisegment_delivery_keeps_original_response_target(
+        self,
+    ):
+        event = Event(903, direct=True)
+        callbacks = {}
+
+        def install(*args, **kwargs):
+            callbacks.update(kwargs)
+            return None
+
+        with patch.object(runtime, "install_send_observer", side_effect=install):
+            await self.plugin.observe_external_replies(event)
+        generator = self.plugin.on_group_message(event)
+        await anext(generator)
+        for ident in (1001, 1002):
+            receipt = types.SimpleNamespace(
+                message_id=ident, from_user=types.SimpleNamespace(id=9000)
+            )
+            callbacks["on_delivery"](receipt, str(ident), True)
+        event.get_sender_id = lambda: "later-mutation"
+        await self.plugin.on_llm_response(
+            event, types.SimpleNamespace(role="assistant", completion_text="answer")
+        )
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        window = self.plugin.store.active_window(event.unified_msg_origin)
+        records = self.plugin.store.window_messages(
+            event.unified_msg_origin, window["id"]
+        )
+        bot = records[-1]
+        self.assertEqual(bot["sender_id"], "9000")
+        self.assertEqual(bot["response_to_message_id"], "903")
+        self.assertEqual(bot["response_to_sender_id"], "human")
+        self.assertEqual(bot["reply_to_message_id"], "")
+
     async def test_out_of_scope_and_commands_are_inert(self):
         for event in [
             Event(1, platform="discord"),

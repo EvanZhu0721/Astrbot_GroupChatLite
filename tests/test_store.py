@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -20,6 +21,51 @@ class StoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.tmp.cleanup()
+
+    def test_relationships_keep_telegram_ids_separate_from_local_ids(self):
+        saved = self.human(
+            "900",
+            100,
+            sender_id="alice",
+            reply_to_message_id="899",
+            reply_to_sender_id="bob",
+        )
+        self.assertNotEqual(str(saved["message"]["id"]), "900")
+        self.assertEqual(saved["message"]["reply_to_message_id"], "899")
+        bot = self.store.add_bot(
+            "tg:group:1:topic:1",
+            saved["window"]["id"],
+            "gcl:900",
+            "answer",
+            101,
+            101,
+            sender_id="bot",
+            response_to_message_id="900",
+            response_to_sender_id="alice",
+        )
+        self.assertEqual(bot["message"]["response_to_message_id"], "900")
+        self.assertEqual(bot["message"]["reply_to_message_id"], "")
+
+    def test_legacy_database_migrates_without_inventing_relationships(self):
+        saved = self.human("900", 100, sender_id="legacy", sender_name="Unknown")
+        self.store.close()
+        path = Path(self.tmp.name) / "history.sqlite3"
+        with closing(sqlite3.connect(path)) as connection:
+            for name in (
+                "reply_to_message_id",
+                "reply_to_sender_id",
+                "response_to_message_id",
+                "response_to_sender_id",
+            ):
+                connection.execute(f"ALTER TABLE messages DROP COLUMN {name}")
+        self.store = Store(path)
+        record = self.store.window_messages(
+            "tg:group:1:topic:1", saved["window"]["id"]
+        )[0]
+        self.assertEqual(record["sender_id"], "legacy")
+        self.assertEqual(record["source_message_id"], "900")
+        self.assertEqual(record["response_to_sender_id"], "")
+        self.assertEqual(record["reply_to_message_id"], "")
 
     def human(self, source, stamp, umo="tg:group:1:topic:1", **kwargs):
         return self.store.add_human(

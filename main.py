@@ -483,6 +483,55 @@ class AstrbotGroupChatLite(Star):
                     " [此前选中的图片文件现已不可用，本次未附带；不能推断图像内容]"
                 )
 
+    def _message_identity(self, event):
+        raw = self._raw_message(event)
+        author = getattr(raw, "sender_chat", None) or getattr(raw, "from_user", None)
+        sender_id = str(getattr(author, "id", None) or event.get_sender_id() or "")
+        full_name = " ".join(
+            str(getattr(author, key, "") or "").strip()
+            for key in ("first_name", "last_name")
+        ).strip()
+        candidates = (
+            getattr(author, "full_name", None),
+            getattr(author, "title", None),
+            full_name,
+            getattr(author, "username", None),
+            event.get_sender_name(),
+        )
+        name = next(
+            (
+                str(value).strip()
+                for value in candidates
+                if value and str(value).strip().casefold() not in {"", "unknown"}
+            ),
+            sender_id,
+        )
+        replied = getattr(raw, "reply_to_message", None)
+        target = getattr(replied, "sender_chat", None) or getattr(
+            replied, "from_user", None
+        )
+        reply_id = getattr(replied, "message_id", None)
+        reply_sender = getattr(target, "id", None)
+        topic_root = bool(
+            getattr(raw, "is_topic_message", False)
+            and reply_id is not None
+            and getattr(raw, "message_thread_id", None) == reply_id
+        )
+        if topic_root:
+            reply_id = reply_sender = None
+        elif reply_id is None:
+            for part in event.message_obj.message:
+                if isinstance(part, Reply):
+                    reply_id = getattr(part, "id", None)
+                    reply_sender = getattr(part, "sender_id", None)
+                    break
+        return dict(
+            sender_id=sender_id,
+            sender_name=name,
+            reply_to_message_id=str(reply_id or ""),
+            reply_to_sender_id=str(reply_sender or ""),
+        )
+
     def _observe_score_message(self, event):
         raw = self._raw_message(event)
         replied = getattr(raw, "reply_to_message", None)
@@ -532,12 +581,12 @@ class AstrbotGroupChatLite(Star):
             text=self._text(event),
             event_at=self._event_time(event, observed_at),
             observed_at=observed_at,
-            sender_id=str(event.get_sender_id()),
-            sender_name=str(event.get_sender_name() or ""),
+            **self._message_identity(event),
             idle_seconds=cfg.idle_seconds,
         )
         if any(isinstance(part, Image) for part in self._media_parts(event)):
             original["text"] += " [含图片]"
+        delivered_bot_id = str(event.get_self_id())
 
         def should_observe():
             return (
@@ -554,8 +603,15 @@ class AstrbotGroupChatLite(Star):
             return should_observe() and not event.get_extra(MARKER)
 
         def on_delivery(receipt, delivery_key, is_streaming):
+            nonlocal delivered_bot_id
             if not should_observe():
                 return
+            author = getattr(receipt, "from_user", None)
+            delivered_bot_id = str(getattr(author, "id", None) or delivered_bot_id)
+            marker = event.get_extra(MARKER)
+            if marker is not None:
+                marker["delivery_confirmed"] = True
+                marker["bot_sender_id"] = delivered_bot_id
             self._scoring_state.record_delivery(
                 umo,
                 receipt.message_id,
@@ -583,6 +639,8 @@ class AstrbotGroupChatLite(Star):
                     original["idle_seconds"],
                     sender_id=original["sender_id"],
                     sender_name=original["sender_name"],
+                    reply_to_message_id=original["reply_to_message_id"],
+                    reply_to_sender_id=original["reply_to_sender_id"],
                 )
                 now = self._clock()
                 self.store.add_bot(
@@ -592,6 +650,10 @@ class AstrbotGroupChatLite(Star):
                     text,
                     now,
                     now,
+                    sender_id=delivered_bot_id,
+                    sender_name="Bot",
+                    response_to_message_id=original["source_id"].removeprefix("tg:"),
+                    response_to_sender_id=original["sender_id"],
                 )
             except Exception as exc:
                 logger.warning(
@@ -729,8 +791,7 @@ class AstrbotGroupChatLite(Star):
             event_at,
             now,
             cfg.idle_seconds,
-            sender_id=str(event.get_sender_id()),
-            sender_name=str(event.get_sender_name() or ""),
+            **self._message_identity(event),
         )
         if not saved["inserted"]:
             return
@@ -812,6 +873,7 @@ class AstrbotGroupChatLite(Star):
                     window_id = saved["window"]["id"]
                     snapshot = self._context_snapshot(umo, window_id, cfg)
                     snapshot["current_input_message_id"] = saved["message"]["id"]
+                    snapshot["current_input"] = saved["message"]
                     ttl = getattr(cfg, "stale_message_seconds", 300)
                     room.pending = {
                         rev: stamp
@@ -856,6 +918,7 @@ class AstrbotGroupChatLite(Star):
                     history = render_context(
                         messages,
                         current_message_id=saved["message"]["id"],
+                        current_input=saved["message"],
                         previous_messages=snapshot["previous_messages"],
                         previous_summary=snapshot["previous_summary"],
                         image_sources=snapshot["image_sources"],
@@ -869,6 +932,7 @@ class AstrbotGroupChatLite(Star):
                         "final_text": "",
                         "aborted": False,
                         "images": snapshot["images"],
+                        "bot_sender_id": str(event.get_self_id()),
                     }
                     event.set_extra(MARKER, marker)
                     logger.info(
@@ -892,6 +956,18 @@ class AstrbotGroupChatLite(Star):
                             marker["final_text"],
                             finished,
                             finished,
+                            sender_id=marker["bot_sender_id"],
+                            sender_name="Bot",
+                            response_to_message_id=(
+                                source_id.removeprefix("tg:")
+                                if marker.get("delivery_confirmed")
+                                else ""
+                            ),
+                            response_to_sender_id=(
+                                saved["message"]["sender_id"]
+                                if marker.get("delivery_confirmed")
+                                else ""
+                            ),
                         )
                     logger.info("[GroupChatLite] 正式回复结束 window=%s", window_id)
                 finally:
@@ -982,6 +1058,7 @@ class AstrbotGroupChatLite(Star):
                 messages,
                 max_chars=cfg.decision_max_chars,
                 current_message_id=snapshot.get("current_input_message_id"),
+                current_input=snapshot.get("current_input"),
                 previous_messages=snapshot.get("previous_messages", []),
                 previous_summary=snapshot.get("previous_summary"),
                 image_sources=snapshot.get("image_sources", []),
